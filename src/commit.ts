@@ -36,6 +36,13 @@ const ensureIndexes = async () => {
       console.log('Index on key field already exists');
     }
   } catch (error) {
+    const mongoErr = error as any;
+    if (mongoErr?.code === 26 || mongoErr?.codeName === 'NamespaceNotFound') {
+      console.log('Creating index on key field for new database...');
+      await CommitModel.collection.createIndex({ key: 1 });
+      console.log('Index on key field created successfully');
+      return;
+    }
     console.error('Error ensuring indexes:', error);
   }
 };
@@ -118,37 +125,22 @@ export class TxStateManager {
       }
     }
 
-    async insertTxIntoCommit (tx: TxWitness): Promise<boolean>{
-      const counter = this.preemptcounter;
+    async insertTxIntoCommit (tx: TxWitness, isReplay = false): Promise<boolean>{
       const key = this.currentUncommitMerkleRoot;
       this.preemptcounter += 1;
+      if (isReplay) {
+        return true;
+      }
       try {
-        const commit = await CommitModel.findOne({ key });
-        console.log(`Inserting tx into bundle with key: ${key}`);
-        if (commit) {
-          // If key exists, push new item to items array
-          if (commit.items.length <= counter) {
-            commit.items.push(tx);
-            await commit.save();
-            return false; // new tx, needs track
-          } else {
-            let trackedTx = commit.items[counter];
-            console.assert(tx.sigx == trackedTx.sigx);
-            return true; // event already tracked
-          }
-        } else {
-          // If key does not exist, create a new commit record
-          const newCommit = new CommitModel({
-            key,
-            items: [tx], // Insert the new item as the first element
-          });
-          await newCommit.save();
-          return false;
-        }
+        await CommitModel.findOneAndUpdate(
+          { key },
+          { $setOnInsert: { key }, $push: { items: tx } },
+          { upsert: true }
+        );
+        return false; // new tx, needs track
       } catch (error) {
         console.error('Error inserting tx into current bundle:', error);
         throw (error)
       }
     };
 }
-

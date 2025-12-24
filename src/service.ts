@@ -2,7 +2,7 @@
 import initBootstrap, * as bootstrap from "./bootstrap/bootstrap.js";
 import initApplication, * as application from "./application/application.js";
 import { test_merkle_db_service } from "./test.js";
-import { verifySign, LeHexBN, sign, PlayerConvention, ZKWasmAppRpc, createCommand } from "zkwasm-minirollup-rpc";
+import { LeHexBN, sign, PlayerConvention, ZKWasmAppRpc, createCommand } from "zkwasm-minirollup-rpc";
 import { Queue, Worker, Job } from 'bullmq';
 import IORedis from 'ioredis';
 import express, {Express} from 'express';
@@ -17,10 +17,17 @@ import mongoose from 'mongoose';
 import {hexStringToMerkleRoot, merkleRootToBeHexString} from "./lib.js";
 import {sha256} from "ethers";
 import {TxStateManager} from "./commit.js";
-import {queryAccounts, storeAccount} from "./account.js";
+import {ensureAccountIndexes, queryAccounts, storeAccount} from "./account.js";
 
 // Load environment variables from .env file
 dotenv.config();
+
+const LOG_TX = process.env.LOG_TX === '1';
+const LOG_BUNDLE = process.env.LOG_BUNDLE === '1';
+const LOG_QUEUE_STATS = process.env.LOG_QUEUE_STATS === '1';
+const LOG_AUTOJOB = process.env.LOG_AUTOJOB === '1';
+const DISABLE_AUTOTICK = process.env.DISABLE_AUTOTICK === '1';
+const AUTOJOB_FATAL = process.env.AUTOJOB_FATAL === '1';
 
 let deploymode = false;
 let remote = false;
@@ -179,11 +186,15 @@ export class Service {
   }
 
   async trackBundle(taskId: string) {
-    console.log("track bundle:", this.bundleIndex);
+    if (LOG_BUNDLE) {
+      console.log("track bundle:", this.bundleIndex);
+    }
     let preMerkleRootStr = "";
     if (this.preMerkleRoot != null) {
       preMerkleRootStr = merkleRootToBeHexString(this.preMerkleRoot);
-      console.log("update merkle chain ...", preMerkleRootStr);
+      if (LOG_BUNDLE) {
+        console.log("update merkle chain ...", preMerkleRootStr);
+      }
       try {
         const prevBundle = await modelBundle.findOneAndUpdate({
           merkleRoot: merkleRootToBeHexString(this.preMerkleRoot),
@@ -194,14 +205,18 @@ export class Service {
           console.log(`fatal: bundleIndex does not match: ${this.bundleIndex}, ${prevBundle!.bundleIndex}`);
           throw Error(`Bundle Index does not match: current index is ${this.bundleIndex}, previous index is ${prevBundle!.bundleIndex}`);
         }
-        console.log("merkle chain prev is", prevBundle);
+        if (LOG_BUNDLE) {
+          console.log("merkle chain prev is", prevBundle);
+        }
       } catch (e) {
         console.log(`fatal: can not find bundle for previous MerkleRoot: ${merkleRootToBeHexString(this.preMerkleRoot)}`);
         throw Error(`fatal: can not find bundle for previous MerkleRoot: ${merkleRootToBeHexString(this.preMerkleRoot)}`);
       }
     }
     this.bundleIndex += 1;
-    console.log("add transaction bundle:", this.bundleIndex, merkleRootToBeHexString(this.merkleRoot));
+    if (LOG_BUNDLE) {
+      console.log("add transaction bundle:", this.bundleIndex, merkleRootToBeHexString(this.merkleRoot));
+    }
     const bundleRecord = new modelBundle({
       merkleRoot: merkleRootToBeHexString(this.merkleRoot),
       preMerkleRoot: preMerkleRootStr,
@@ -210,7 +225,9 @@ export class Service {
     });
     try {
       await bundleRecord.save();
-      console.log(`task recorded with key: ${merkleRootToBeHexString(this.merkleRoot)}`);
+      if (LOG_BUNDLE) {
+        console.log(`task recorded with key: ${merkleRootToBeHexString(this.merkleRoot)}`);
+      }
     }
     catch (e) {
       let record = await modelBundle.findOneAndUpdate({
@@ -223,7 +240,9 @@ export class Service {
       }, {});
       console.log("fatal: conflict db merkle");
       // TODO: do we need to trim the corrputed branch?
-      console.log(record);
+      if (LOG_BUNDLE) {
+        console.log(record);
+      }
       //throw e
     }
     return bundleRecord;
@@ -232,11 +251,13 @@ export class Service {
 
   async install_transactions(tx: TxWitness, jobid: string | undefined, events: BigUint64Array, isReplay = false) {
     // const installStartTime = performance.now();
-    console.log("installing transaction into rollup ...");
+    if (LOG_TX) {
+      console.log("installing transaction into rollup ...");
+    }
     transactions_witness.push(tx);
     // if (!isReplay) {
     // const insertStart = performance.now();
-    const handled = await this.txManager.insertTxIntoCommit(tx);
+    const handled = await this.txManager.insertTxIntoCommit(tx, isReplay);
     // const insertEnd = performance.now();
     // console.log(`[${getTimestamp()}] insertTxIntoCommit took: ${insertEnd - insertStart}ms, handled: ${handled}`);
     if (handled == false) {
@@ -247,7 +268,9 @@ export class Service {
     }
     // }
     snapshot = JSON.parse(application.snapshot());
-    console.log("transaction installed, rollup pool length is:", transactions_witness.length);
+    if (LOG_TX) {
+      console.log("transaction installed, rollup pool length is:", transactions_witness.length);
+    }
     try {
       if (!isReplay) {
         // const saveStart = performance.now();
@@ -261,11 +284,15 @@ export class Service {
     }
     if (application.preempt()) {
       // const preemptStart = performance.now();
-      console.log("rollup reach its preemption point, generating proof:");
+      if (LOG_BUNDLE) {
+        console.log("rollup reach its preemption point, generating proof:");
+      }
       let txdata = application.finalize();
       // const finalizeEnd = performance.now();
       // console.log(`[${getTimestamp()}] application.finalize took: ${finalizeEnd - preemptStart}ms`);
-      console.log("txdata is:", txdata);
+      if (LOG_BUNDLE) {
+        console.log("txdata is:", txdata);
+      }
       let task_id = null;
 
       // TODO: store a bundle before we fail
@@ -279,8 +306,10 @@ export class Service {
         }
       }
       try {
-        console.log("proving task submitted at:", task_id);
-        console.log("tracking task in db current ...", merkleRootToBeHexString(this.merkleRoot));
+        if (LOG_BUNDLE) {
+          console.log("proving task submitted at:", task_id);
+          console.log("tracking task in db current ...", merkleRootToBeHexString(this.merkleRoot));
+        }
 
         // const trackStart = performance.now();
         await this.trackBundle(task_id);
@@ -306,9 +335,13 @@ export class Service {
         transactions_witness = new Array();
 
         // reset application here
-        console.log("restore root:", this.merkleRoot);
+        if (LOG_BUNDLE) {
+          console.log("restore root:", this.merkleRoot);
+        }
         // const resetStart = performance.now();
-        await (initApplication as any)(bootstrap);
+        if (process.env.RELOAD_WASM_ON_BUNDLE === '1') {
+          await (initApplication as any)(bootstrap);
+        }
         application.initialize(this.merkleRoot);
         await this.txManager.moveToCommit(merkleRootToBeHexString(this.merkleRoot));
         // const resetEnd = performance.now();
@@ -340,6 +373,7 @@ export class Service {
     
     // Call ensureIndexes after connection is established
     await ensureIndexes();
+    await ensureAccountIndexes();
 
     console.log("connecting redis server:", redisHost);
     const connection = new IORedis(
@@ -435,7 +469,7 @@ export class Service {
     this.merkleRoot = application.query_root();
 
     // Automatically add a job to the queue every few seconds
-    if (application.autotick()) {
+    if (!DISABLE_AUTOTICK && application.autotick()) {
       setInterval(async () => {
         try {
           await myQueue.add('autoJob', {command:0});
@@ -450,20 +484,22 @@ export class Service {
       this.blocklist.clear();
     }, 30000);
 
-    // Monitor queue length every 2 seconds
-    setInterval(async () => {
-      try {
-        const waitingCount = await myQueue.getWaitingCount();
-        const activeCount = await myQueue.getActiveCount();
-        const delayedCount = await myQueue.getDelayedCount();
-        const completedCount = await myQueue.getCompletedCount();
-        const failedCount = await myQueue.getFailedCount();
-        
-        console.log(`[${getTimestamp()}] Queue Stats - Waiting: ${waitingCount}, Active: ${activeCount}, Delayed: ${delayedCount}, Completed: ${completedCount}, Failed: ${failedCount}`);
-      } catch (error) {
-        console.error('Error getting queue stats:', error);
-      }
-    }, 2000);
+    // Monitor queue length every 2 seconds (disabled by default for TPS)
+    if (LOG_QUEUE_STATS) {
+      setInterval(async () => {
+        try {
+          const waitingCount = await myQueue.getWaitingCount();
+          const activeCount = await myQueue.getActiveCount();
+          const delayedCount = await myQueue.getDelayedCount();
+          const completedCount = await myQueue.getCompletedCount();
+          const failedCount = await myQueue.getFailedCount();
+
+          console.log(`[${getTimestamp()}] Queue Stats - Waiting: ${waitingCount}, Active: ${activeCount}, Delayed: ${delayedCount}, Completed: ${completedCount}, Failed: ${failedCount}`);
+        } catch (error) {
+          console.error('Error getting queue stats:', error);
+        }
+      }, 2000);
+    }
 
     this.worker = new Worker('sequencer', async job => {
       const jobStartTime = performance.now();
@@ -475,12 +511,16 @@ export class Service {
           const randStartTime = performance.now();
           let rand = await generateRandomSeed();
           const randEndTime = performance.now();
-          console.log(`[${getTimestamp()}] AutoJob generateRandomSeed took: ${randEndTime - randStartTime}ms`);
+          if (LOG_AUTOJOB) {
+            console.log(`[${getTimestamp()}] AutoJob generateRandomSeed took: ${randEndTime - randStartTime}ms`);
+          }
 
           const oldSeedStartTime = performance.now();
           let oldSeed = application.randSeed();
           const oldSeedEndTime = performance.now();
-          console.log(`[${getTimestamp()}] AutoJob get old seed took: ${oldSeedEndTime - oldSeedStartTime}ms`);
+          if (LOG_AUTOJOB) {
+            console.log(`[${getTimestamp()}] AutoJob get old seed took: ${oldSeedEndTime - oldSeedStartTime}ms`);
+          }
 
           const oldSeedFindStartTime = performance.now();
           let seed = 0n;
@@ -491,7 +531,9 @@ export class Service {
             seed = randRecord[0].seed!.readBigInt64LE();
           };
           const oldSeedFindEndTime = performance.now();
-          console.log(`[${getTimestamp()}] AutoJob find old seed took: ${oldSeedFindEndTime - oldSeedFindStartTime}ms`);
+          if (LOG_AUTOJOB) {
+            console.log(`[${getTimestamp()}] AutoJob find old seed took: ${oldSeedFindEndTime - oldSeedFindStartTime}ms`);
+          }
 
           let signature = sign(createCommand(0n, 0n, [seed, rand, 0n, 0n]), get_server_admin_key());
           //console.log("signautre is", signature);
@@ -500,38 +542,55 @@ export class Service {
           const verifyTxSignatureStartTime = performance.now();
           application.verify_tx_signature(u64array);
           const verifyTxSignatureEndTime = performance.now();
-          console.log(`[${getTimestamp()}] AutoJob verify_tx_signature took: ${verifyTxSignatureEndTime - verifyTxSignatureStartTime}ms`);
+          if (LOG_AUTOJOB) {
+            console.log(`[${getTimestamp()}] AutoJob verify_tx_signature took: ${verifyTxSignatureEndTime - verifyTxSignatureStartTime}ms`);
+          }
 
           const handleTxStart = performance.now();
           let txResult = application.handle_tx(u64array);
           const handleTxEnd = performance.now();
-          console.log(`[${getTimestamp()}] AutoJob handle_tx took: ${handleTxEnd - handleTxStart}ms`);
+          if (LOG_AUTOJOB) {
+            console.log(`[${getTimestamp()}] AutoJob handle_tx took: ${handleTxEnd - handleTxStart}ms`);
+          }
           
           const installStart = performance.now();
           await this.install_transactions(signature, job.id, txResult);
           const installEnd = performance.now();
-          console.log(`[${getTimestamp()}] AutoJob install_transactions took: ${installEnd - installStart}ms`);
+          if (LOG_AUTOJOB) {
+            console.log(`[${getTimestamp()}] AutoJob install_transactions took: ${installEnd - installStart}ms`);
+          }
         } catch (error) {
           const jobEndTime = performance.now();
           console.log(`[${getTimestamp()}] AutoJob failed after ${jobEndTime - jobStartTime}ms:`, error);
-          console.log("fatal: handling auto tick error, process will terminate.", error);
-          process.exit(1);
+          if (AUTOJOB_FATAL) {
+            console.log("fatal: handling auto tick error, process will terminate.", error);
+            process.exit(1);
+          }
+          throw error;
         }
         const jobEndTime = performance.now();
-        console.log(`[${getTimestamp()}] AutoJob completed in ${jobEndTime - jobStartTime}ms`);
+        if (LOG_AUTOJOB) {
+          console.log(`[${getTimestamp()}] AutoJob completed in ${jobEndTime - jobStartTime}ms`);
+        }
       } else if (job.name == 'transaction' || job.name == 'replay') {
-        console.log("handle transaction ...");
+        if (LOG_TX) {
+          console.log("handle transaction ...");
+        }
         try {
           let signature = job.data.value;
           const verifySignatureStart = performance.now();
           let u64array = signature_to_u64array(signature);
           application.verify_tx_signature(u64array);
           const verifySignatureEnd = performance.now();
-          console.log(`[${getTimestamp()}] ${job.name} verify_tx_signature took: ${verifySignatureEnd - verifySignatureStart}ms`);
+          if (LOG_TX) {
+            console.log(`[${getTimestamp()}] ${job.name} verify_tx_signature took: ${verifySignatureEnd - verifySignatureStart}ms`);
+          }
           const handleTxStart = performance.now();
           let txResult = application.handle_tx(u64array);
           const handleTxEnd = performance.now();
-          console.log(`[${getTimestamp()}] ${job.name} handle_tx took: ${handleTxEnd - handleTxStart}ms`);
+          if (LOG_TX) {
+            console.log(`[${getTimestamp()}] ${job.name} handle_tx took: ${handleTxEnd - handleTxStart}ms`);
+          }
           
           let errorCode = txResult[0];
           if (errorCode == 0n) {
@@ -539,7 +598,9 @@ export class Service {
             const installStart = performance.now();
             await this.install_transactions(signature, job.id, txResult, job.name=='replay');
             const installEnd = performance.now();
-            console.log(`[${getTimestamp()}] ${job.name} install_transactions took: ${installEnd - installStart}ms`);
+            if (LOG_TX) {
+              console.log(`[${getTimestamp()}] ${job.name} install_transactions took: ${installEnd - installStart}ms`);
+            }
             try {
               // If this is the first time of running this tx, the store should work.
               // If the store does not work (jobId conflict) then either there is a jobid
@@ -566,7 +627,9 @@ export class Service {
           }
 
           // const jobEndTime = performance.now();
-          console.log("done");
+          if (LOG_TX) {
+            console.log("done");
+          }
           let player = null;
           const getStateStartTime = performance.now();
           if (job.name != "replay") {
@@ -581,7 +644,9 @@ export class Service {
             bundle: this.txManager.currentUncommitMerkleRoot,
           };
           const getStateEndTime = performance.now();
-          console.log(`[${getTimestamp()}] ${job.name} get_state took: ${getStateEndTime - getStateStartTime}ms`);
+          if (LOG_TX) {
+            console.log(`[${getTimestamp()}] ${job.name} get_state took: ${getStateEndTime - getStateStartTime}ms`);
+          }
           return result
         } catch (e) {
           const jobEndTime = performance.now();
@@ -594,7 +659,9 @@ export class Service {
         }
       }
       const jobEndTime = performance.now();
-      console.log(`[${getTimestamp()}] ${job.name} completed in ${jobEndTime - jobStartTime}ms`);
+      if (LOG_TX) {
+        console.log(`[${getTimestamp()}] ${job.name} completed in ${jobEndTime - jobStartTime}ms`);
+      }
     }, {connection});
   }
 
@@ -619,27 +686,28 @@ export class Service {
       }
 
       try {
-        const hash = new LeHexBN(value.hash);
-        const pkx = new LeHexBN(value.pkx);
-        const pky = new LeHexBN(value.pky);
-        const sigx = new LeHexBN(value.sigx);
-        const sigy = new LeHexBN(value.sigy);
-        const sigr = new LeHexBN(value.sigr);
-        if (verifySign(hash, pkx, pky, sigx, sigy, sigr) == false) {
-          console.error('Invalid signature:');
-          res.status(500).send('Invalid signature');
-        } else {
-          const fc = this.blocklist.get(value.pkx) || 0;
-          if (fc > 3) {
-            res.status(500).send('This account is blocked for 1 minutes for multiple incorrect arguments');
-          } else {
-            const job = await this.queue!.add('transaction', { value });
-            res.status(201).send({
-              success: true,
-              jobid: job.id
-            });
-          }
+        try {
+          const u64array = signature_to_u64array(value);
+          application.verify_tx_signature(u64array);
+        } catch (err) {
+          console.error('Invalid signature:', err);
+          return res.status(500).send('Invalid signature');
         }
+
+        const fc = this.blocklist.get(value.pkx) || 0;
+        if (fc > 3) {
+          return res
+            .status(500)
+            .send(
+              'This account is blocked for 1 minutes for multiple incorrect arguments'
+            );
+        }
+
+        const job = await this.queue!.add('transaction', { value });
+        return res.status(201).send({
+          success: true,
+          jobid: job.id
+        });
       } catch (error) {
         console.error('Error adding job to the queue:', error);
         res.status(500).send('Failed to add job to the queue');
@@ -684,7 +752,9 @@ export class Service {
           player: player,
           state: snapshot
         }
-        await storeAccount(value.pkx, player, this.playerIndexer);
+        void storeAccount(value.pkx, player, this.playerIndexer).catch((error) => {
+          console.error('storeAccount failed:', error);
+        });
         res.status(201).send({
           success: true,
           data: JSON.stringify(result),
@@ -751,6 +821,25 @@ export class Service {
           error: e.toString(),
           data: []
         });
+      }
+    });
+
+    app.get('/job_status/:id', async (req, res) => {
+      try {
+        const jobId = req.params.id;
+        const job = await Job.fromId(this.queue!, jobId);
+        if (!job) {
+          return res.status(404).json({ message: 'Job not found' });
+        }
+        return res.status(200).json({
+          id: job.id,
+          name: job.name,
+          processedOn: job.processedOn,
+          finishedOn: job.finishedOn,
+          failedReason: job.failedReason,
+        });
+      } catch (err) {
+        res.status(500).json({ message: (err as Error).toString() });
       }
     });
 
