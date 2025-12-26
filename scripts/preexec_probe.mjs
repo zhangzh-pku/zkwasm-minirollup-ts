@@ -8,6 +8,7 @@ const KEY_COUNT = parseInt(process.env.KEY_COUNT ?? "1", 10);
 const KEY_BASE = BigInt(process.env.KEY_BASE ?? "1234567");
 const NONCE_BASE = BigInt(process.env.NONCE_BASE ?? Date.now());
 const SKIP_VERIFY = process.env.SKIP_VERIFY === "1";
+const COMMAND = BigInt(process.env.COMMAND ?? "0");
 
 // Default to sync HTTP inside worker threads (avoids per-worker child-process spawn in syncproc mode).
 process.env.MERKLE_RPC_MODE = process.env.MERKLE_RPC_MODE ?? "http";
@@ -109,7 +110,7 @@ const pool = new WorkerPool(workerUrl, WORKERS);
 try {
   const payloads = [];
   for (let i = 0; i < TOTAL; i++) {
-    const cmd = createCommand(NONCE_BASE + BigInt(i), 0n, [0n, 0n, 0n, 0n]);
+    const cmd = createCommand(NONCE_BASE + BigInt(i), COMMAND, [0n, 0n, 0n, 0n]);
     const sig = sign(cmd, keyFor(i));
     payloads.push({
       id: i,
