@@ -147,4 +147,35 @@ export function get_record(hash) {
 
 }
 
+function requestSession(method, params, id) {
+  const requestData = {
+    jsonrpc: '2.0',
+    method,
+    params,
+    id,
+  };
+  const responseStr = requestMerkleData(requestData);
+  const response = JSON.parse(responseStr);
+  if (response.error == undefined) {
+    return response.result;
+  } else {
+    console.error(`Failed to ${method}:`, response.error);
+    throw new Error(`Failed to ${method}`);
+  }
+}
 
+export function begin_session() {
+  return requestSession('begin_session', {}, 5);
+}
+
+export function drop_session(session) {
+  return requestSession('drop_session', { session }, 6);
+}
+
+export function reset_session(session) {
+  return requestSession('reset_session', { session }, 7);
+}
+
+export function commit_session(session) {
+  return requestSession('commit_session', { session }, 8);
+}

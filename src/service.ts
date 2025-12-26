@@ -1,5 +1,6 @@
 //import initHostBind, * as hostbind from "./wasmbind/hostbind.js";
 import initBootstrap, * as bootstrap from "./bootstrap/bootstrap.js";
+import { begin_session, commit_session, drop_session } from "./bootstrap/rpcbind.js";
 import initApplication, * as application from "./application/application.js";
 import { test_merkle_db_service } from "./test.js";
 import { verifySign, LeHexBN, sign, PlayerConvention, ZKWasmAppRpc, createCommand } from "zkwasm-minirollup-rpc";
@@ -22,6 +23,8 @@ import {queryAccounts, storeAccount} from "./account.js";
 // Load environment variables from .env file
 dotenv.config();
 
+const LOG_BUNDLE = process.env.LOG_BUNDLE === '1';
+const MERKLE_SESSION_OVERLAY = process.env.MERKLE_SESSION_OVERLAY === '1';
 let deploymode = false;
 let remote = false;
 let migrate = false;
@@ -104,6 +107,7 @@ export class Service {
   preMerkleRoot: BigUint64Array | null;
   txManager: TxStateManager;
   blocklist: Map<string, number>;
+  merkleSession: string | null;
 
   constructor(
       cb: (arg: TxWitness, events: BigUint64Array) => Promise<void> = async (arg: TxWitness, events: BigUint64Array) => {},
@@ -127,6 +131,7 @@ export class Service {
     this.preMerkleRoot = null;
     this.txManager = new TxStateManager(merkleRootToBeHexString(this.merkleRoot));
     this.blocklist = new Map();
+    this.merkleSession = null;
   }
 
   async syncToLatestMerkelRoot() {
@@ -305,6 +310,13 @@ export class Service {
         await (initApplication as any)(bootstrap);
         application.initialize(this.merkleRoot);
         await this.txManager.moveToCommit(merkleRootToBeHexString(this.merkleRoot));
+
+        if (MERKLE_SESSION_OVERLAY && this.merkleSession) {
+          const commitResult = commit_session(this.merkleSession);
+          if (LOG_BUNDLE) {
+            console.log("merkle overlay committed:", commitResult);
+          }
+        }
         // const resetEnd = performance.now();
         // console.log(`[${getTimestamp()}] Application reset took: ${resetEnd - resetStart}ms`);
       } catch (e) {
@@ -365,6 +377,25 @@ export class Service {
 
     console.log("check merkel database connection ...");
     test_merkle_db_service();
+
+    if (MERKLE_SESSION_OVERLAY) {
+      try {
+        this.merkleSession = begin_session();
+        (globalThis as any).__MERKLE_SESSION = this.merkleSession;
+        console.log("merkle session overlay enabled:", this.merkleSession);
+        process.once("exit", () => {
+          if (!this.merkleSession) return;
+          try {
+            drop_session(this.merkleSession);
+          } catch {
+            // ignore
+          }
+        });
+      } catch (e) {
+        console.log("fatal: begin merkle session failed", e);
+        process.exit(1);
+      }
+    }
 
     if (migrate) {
       if (remote) {
