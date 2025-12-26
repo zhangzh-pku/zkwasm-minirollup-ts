@@ -37,6 +37,11 @@ function intersects(a, b) {
   return false;
 }
 
+function hashKey(hashArray) {
+  if (!Array.isArray(hashArray)) return "";
+  return hashArray.join(",");
+}
+
 function greedyConflictFreeSubset(items) {
   const unionWrites = new Set();
   const unionReads = new Set();
@@ -146,14 +151,27 @@ try {
     totalGetRecords += r.trace.getRecords.length;
     totalUpdateRecords += r.trace.updateRecords.length;
 
-    const reads = new Set(r.trace.reads);
-    const writes = new Set(r.trace.writes.map((w) => w.index));
+    const reads = new Set();
+    const writes = new Set();
+
+    for (const idx of r.trace.reads) {
+      reads.add(`leaf:${idx}`);
+    }
+    for (const w of r.trace.writes) {
+      writes.add(`leaf:${w.index}`);
+    }
+    for (const rec of r.trace.getRecords) {
+      reads.add(`record:${hashKey(rec.hash)}`);
+    }
+    for (const rec of r.trace.updateRecords) {
+      writes.add(`record:${hashKey(rec.hash)}`);
+    }
     items.push({ id: r.id, reads, writes });
 
-    for (const idx of reads) {
+    for (const idx of r.trace.reads) {
       readerCount.set(idx, (readerCount.get(idx) ?? 0) + 1);
     }
-    for (const idx of writes) {
+    for (const idx of r.trace.writes.map((w) => w.index)) {
       writerCount.set(idx, (writerCount.get(idx) ?? 0) + 1);
     }
   }

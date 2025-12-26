@@ -1,6 +1,7 @@
 import { parentPort } from "node:worker_threads";
 
 import initBootstrap, * as bootstrap from "../bootstrap/bootstrap.js";
+import { begin_session, drop_session, reset_session } from "../bootstrap/rpcbind.js";
 import initApplication, * as application from "../application/application.js";
 import { signature_to_u64array } from "../signature.js";
 
@@ -68,11 +69,29 @@ function normalizeTrace(trace: Trace): PreexecOk["trace"] {
     data,
   }));
 
+  const uniqGetRecords = [];
+  const seenGetRecords = new Set<string>();
+  for (const r of getRecords) {
+    if (!r || !Array.isArray(r.hash)) continue;
+    const key = r.hash.join(",");
+    if (seenGetRecords.has(key)) continue;
+    seenGetRecords.add(key);
+    uniqGetRecords.push(r);
+  }
+
+  const lastUpdateByHash = new Map<string, { hash: number[]; data: string[] }>();
+  for (const r of updateRecords) {
+    if (!r || !Array.isArray(r.hash) || !Array.isArray(r.data)) continue;
+    const key = r.hash.join(",");
+    lastUpdateByHash.set(key, r);
+  }
+  const uniqUpdateRecords = Array.from(lastUpdateByHash.values());
+
   return {
     reads: uniqReads,
     writes: uniqWrites,
-    getRecords,
-    updateRecords,
+    getRecords: uniqGetRecords,
+    updateRecords: uniqUpdateRecords,
   };
 }
 
@@ -83,6 +102,16 @@ function setGlobalTrace(trace: Trace | null) {
 await (initBootstrap as any)();
 await (initApplication as any)(bootstrap);
 
+const SESSION = begin_session();
+(globalThis as any).__MERKLE_SESSION = SESSION;
+process.once("exit", () => {
+  try {
+    drop_session(SESSION);
+  } catch {
+    // ignore
+  }
+});
+
 if (!parentPort) {
   throw new Error("preexec_worker must run as a Worker");
 }
@@ -90,6 +119,8 @@ if (!parentPort) {
 parentPort.on("message", (msg: PreexecRequest) => {
   void (async () => {
     try {
+      reset_session(SESSION);
+
       const root = new BigUint64Array(msg.root);
       application.initialize(root);
 

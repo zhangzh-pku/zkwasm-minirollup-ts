@@ -53,6 +53,18 @@ function getMerkleTrace() {
   return trace;
 }
 
+function getMerkleSession() {
+  const session = globalThis.__MERKLE_SESSION;
+  if (typeof session !== 'string' || session.length === 0) return null;
+  return session;
+}
+
+function withSession(params) {
+  const session = getMerkleSession();
+  if (!session) return params;
+  return { ...params, session };
+}
+
 function hash2array(hash) {
   const hasharray = [];
   for (let v of hash) {
@@ -74,7 +86,7 @@ function async_get_leaf(root, index) {
   const requestData = {
     jsonrpc: '2.0',
     method: 'get_leaf',
-    params: {root: roothash, index: index.toString()},
+    params: withSession({root: roothash, index: index.toString()}),
     id: 1
   };
   //console.log("get leaf", root);
@@ -109,7 +121,7 @@ function async_update_leaf(root, index, data) {
   const requestData = {
     jsonrpc: '2.0',
     method: 'update_leaf',
-    params: {root: roothash, index: index.toString(), data: datahash},
+    params: withSession({root: roothash, index: index.toString(), data: datahash}),
     id: 2
   };
   //console.log("get leaf", root);
@@ -147,7 +159,7 @@ function async_update_record(hash, data) {
   const requestData = {
     jsonrpc: '2.0',
     method: 'update_record',
-    params: {hash: roothash, data: datavec},
+    params: withSession({hash: roothash, data: datavec}),
     id: 3
   };
   let responseStr = requestMerkle(requestData);
@@ -183,7 +195,7 @@ function async_get_record(hash) {
   const requestData = {
     jsonrpc: '2.0',
     method: 'get_record',
-    params: {hash: hasharray},
+    params: withSession({hash: hasharray}),
     id: 4
   };
 
@@ -214,4 +226,55 @@ export function get_record(hash) {
   }
   return r;
 
+}
+
+export function begin_session() {
+  const requestData = {
+    jsonrpc: '2.0',
+    method: 'begin_session',
+    params: {},
+    id: 5,
+  };
+  const responseStr = requestMerkle(requestData);
+  const response = JSON.parse(responseStr);
+  if (response.error == undefined) {
+    return response.result;
+  } else {
+    console.error('Failed to begin_session:', response.error);
+    throw new Error('Failed to begin_session');
+  }
+}
+
+export function drop_session(session) {
+  const requestData = {
+    jsonrpc: '2.0',
+    method: 'drop_session',
+    params: { session },
+    id: 6,
+  };
+  const responseStr = requestMerkle(requestData);
+  const response = JSON.parse(responseStr);
+  if (response.error == undefined) {
+    return response.result;
+  } else {
+    console.error('Failed to drop_session:', response.error);
+    throw new Error('Failed to drop_session');
+  }
+}
+
+export function reset_session(session) {
+  const requestData = {
+    jsonrpc: '2.0',
+    method: 'reset_session',
+    params: { session },
+    id: 7,
+  };
+  const responseStr = requestMerkle(requestData);
+  const response = JSON.parse(responseStr);
+  if (response.error == undefined) {
+    return response.result;
+  } else {
+    console.error('Failed to reset_session:', response.error);
+    throw new Error('Failed to reset_session');
+  }
 }
