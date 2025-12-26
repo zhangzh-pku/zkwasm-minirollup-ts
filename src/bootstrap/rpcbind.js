@@ -47,6 +47,12 @@ function requestMerkle(requestData) {
   return requestMerkleData(requestData);
 }
 
+function getMerkleTrace() {
+  const trace = globalThis.__MERKLE_TRACE;
+  if (!trace || typeof trace !== 'object') return null;
+  return trace;
+}
+
 function hash2array(hash) {
   const hasharray = [];
   for (let v of hash) {
@@ -89,6 +95,11 @@ export function get_leaf(root, index) {
   const end = performance.now();
   let lag = end - start;
   //console.log("bench-log: get_leaf", lag);
+  const trace = getMerkleTrace();
+  if (trace) {
+    if (!Array.isArray(trace.reads)) trace.reads = [];
+    trace.reads.push(index.toString());
+  }
   return data;
 }
 
@@ -119,6 +130,14 @@ export function update_leaf(root, index, data) {
   const end = performance.now();
   let lag = end - start;
   //console.log("bench-log: update_leaf", lag);
+  const trace = getMerkleTrace();
+  if (trace) {
+    if (!Array.isArray(trace.writes)) trace.writes = [];
+    trace.writes.push({
+      index: index.toString(),
+      data: hash2array(data),
+    });
+  }
   return r;
 }
 
@@ -148,6 +167,14 @@ export function update_record(hash, data) {
   const end = performance.now();
   let lag = end - start;
   //console.log("bench-log: update_record", lag);
+  const trace = getMerkleTrace();
+  if (trace) {
+    if (!Array.isArray(trace.updateRecords)) trace.updateRecords = [];
+    trace.updateRecords.push({
+      hash: hash2array(hash),
+      data: bigintArray2array(data),
+    });
+  }
   return r;
 }
 
@@ -178,6 +205,13 @@ export function get_record(hash) {
   const end = performance.now();
   let lag = end - start;
   //console.log("bench-log: update_record", lag);
+  const trace = getMerkleTrace();
+  if (trace) {
+    if (!Array.isArray(trace.getRecords)) trace.getRecords = [];
+    trace.getRecords.push({
+      hash: hash2array(hash),
+    });
+  }
   return r;
 
 }
