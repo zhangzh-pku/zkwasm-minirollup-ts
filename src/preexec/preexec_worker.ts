@@ -1,7 +1,6 @@
 import { parentPort } from "node:worker_threads";
 
 import initBootstrap, * as bootstrap from "../bootstrap/bootstrap.js";
-import { begin_session, drop_session, reset_session } from "../bootstrap/rpcbind.js";
 import initApplication, * as application from "../application/application.js";
 import { signature_to_u64array } from "../signature.js";
 
@@ -99,18 +98,16 @@ function setGlobalTrace(trace: Trace | null) {
   (globalThis as any).__MERKLE_TRACE = trace;
 }
 
+function setTraceOnlyWrites(enabled: boolean) {
+  (globalThis as any).__MERKLE_TRACE_ONLY_WRITES = enabled;
+}
+
+function setOverlay(overlay: { leaves: Map<string, number[]>; records: Map<string, bigint[]> } | null) {
+  (globalThis as any).__MERKLE_TRACE_OVERLAY = overlay;
+}
+
 await (initBootstrap as any)();
 await (initApplication as any)(bootstrap);
-
-const SESSION = begin_session();
-(globalThis as any).__MERKLE_SESSION = SESSION;
-process.once("exit", () => {
-  try {
-    drop_session(SESSION);
-  } catch {
-    // ignore
-  }
-});
 
 if (!parentPort) {
   throw new Error("preexec_worker must run as a Worker");
@@ -119,8 +116,6 @@ if (!parentPort) {
 parentPort.on("message", (msg: PreexecRequest) => {
   void (async () => {
     try {
-      reset_session(SESSION);
-
       const root = new BigUint64Array(msg.root);
       application.initialize(root);
 
@@ -135,9 +130,13 @@ parentPort.on("message", (msg: PreexecRequest) => {
 
       const trace = makeEmptyTrace();
       setGlobalTrace(trace);
+      setTraceOnlyWrites(true);
+      setOverlay({ leaves: new Map(), records: new Map() });
       const start = performance.now();
       const result = application.handle_tx(u64array);
       timingMs.handleTx = performance.now() - start;
+      setTraceOnlyWrites(false);
+      setOverlay(null);
       setGlobalTrace(null);
 
       const finalRoot = application.query_root();

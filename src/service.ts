@@ -1,6 +1,6 @@
 //import initHostBind, * as hostbind from "./wasmbind/hostbind.js";
 import initBootstrap, * as bootstrap from "./bootstrap/bootstrap.js";
-import { begin_session, commit_session, drop_session } from "./bootstrap/rpcbind.js";
+import { apply_txs, begin_session, commit_session, drop_session } from "./bootstrap/rpcbind.js";
 import initApplication, * as application from "./application/application.js";
 import { test_merkle_db_service } from "./test.js";
 import { LeHexBN, sign, PlayerConvention, ZKWasmAppRpc, createCommand } from "zkwasm-minirollup-rpc";
@@ -9,6 +9,8 @@ import { Queue, Worker, Job } from 'bullmq';
 import IORedis from 'ioredis';
 import express, {Express} from 'express';
 import { createHash } from 'node:crypto';
+import { cpus } from "node:os";
+import { Worker as NodeWorker } from "node:worker_threads";
 import { submitProofWithRetry, has_uncomplete_task, TxWitness, get_latest_proof, has_task } from "./prover.js";
 import { ensureIndexes } from "./commit.js";
 import cors from "cors";
@@ -44,6 +46,414 @@ const MONGO_JOB_BATCH_FATAL = process.env.MONGO_JOB_BATCH_FATAL === '1';
 const LIGHT_JOB_RESULT = process.env.LIGHT_JOB_RESULT === '1';
 const MERKLE_SESSION_OVERLAY = process.env.MERKLE_SESSION_OVERLAY === '1';
 const ENFORCE_SHARD = process.env.ENFORCE_SHARD !== '0';
+
+// Experimental: single-root optimistic concurrency via parallel pre-exec + conflict filtering.
+// - Off by default; enable with OPTIMISTIC_APPLY=1.
+// - Designed for higher TPS; correctness depends on complete trace coverage of state reads/writes.
+const OPTIMISTIC_APPLY = process.env.OPTIMISTIC_APPLY === '1';
+const OPTIMISTIC_WORKERS = (() => {
+  const raw = Number.parseInt(process.env.OPTIMISTIC_WORKERS ?? "", 10);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return Math.max(1, cpus().length);
+})();
+const OPTIMISTIC_BATCH = (() => {
+  const raw = Number.parseInt(process.env.OPTIMISTIC_BATCH ?? "32", 10);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return 32;
+})();
+const OPTIMISTIC_FLUSH_MS = (() => {
+  const raw = Number.parseInt(process.env.OPTIMISTIC_FLUSH_MS ?? "5", 10);
+  if (Number.isFinite(raw) && raw >= 0) return raw;
+  return 5;
+})();
+const OPTIMISTIC_BUNDLE_SIZE = (() => {
+  const raw = Number.parseInt(process.env.OPTIMISTIC_BUNDLE_SIZE ?? "100", 10);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return 100;
+})();
+
+type PreexecTrace = {
+  reads: string[];
+  writes: Array<{ index: string; data: number[] }>;
+  getRecords: Array<{ hash: number[] }>;
+  updateRecords: Array<{ hash: number[]; data: string[] }>;
+};
+
+type PreexecOk = {
+  id: number;
+  ok: true;
+  result: bigint[];
+  finalRoot: bigint[];
+  trace: PreexecTrace;
+  timingMs: {
+    verify?: number;
+    handleTx: number;
+  };
+};
+
+type PreexecErr = {
+  id: number;
+  ok: false;
+  error: string;
+};
+
+type PreexecResponse = PreexecOk | PreexecErr;
+
+type PreexecRequest = {
+  id: number;
+  root: bigint[];
+  signature: TxWitness;
+  skipVerify?: boolean;
+};
+
+function u64ToLeBytes(value: bigint): number[] {
+  const out: number[] = [];
+  let v = value;
+  for (let i = 0; i < 8; i++) {
+    out.push(Number(v & 0xffn));
+    v >>= 8n;
+  }
+  return out;
+}
+
+function rootU64ToBytes(root: BigUint64Array): number[] {
+  const bytes: number[] = [];
+  for (const limb of root) {
+    bytes.push(...u64ToLeBytes(limb));
+  }
+  if (bytes.length !== 32) {
+    throw new Error(`invalid root byte length: ${bytes.length}`);
+  }
+  return bytes;
+}
+
+function bytes32ToRootU64(bytes: readonly number[]): BigUint64Array {
+  if (bytes.length !== 32) {
+    throw new Error(`expected 32 bytes, got ${bytes.length}`);
+  }
+  const limbs: bigint[] = [];
+  for (let i = 0; i < 4; i++) {
+    let limb = 0n;
+    for (let j = 0; j < 8; j++) {
+      limb |= BigInt(bytes[i * 8 + j] ?? 0) << (8n * BigInt(j));
+    }
+    limbs.push(limb);
+  }
+  return new BigUint64Array(limbs);
+}
+
+function recordKey(hash: readonly number[]): string {
+  return hash.join(",");
+}
+
+function intersects(a: Set<string>, b: Set<string>): boolean {
+  for (const x of a) {
+    if (b.has(x)) return true;
+  }
+  return false;
+}
+
+function buildRwSets(trace: PreexecTrace): { reads: Set<string>; writes: Set<string> } {
+  const reads = new Set<string>();
+  const writes = new Set<string>();
+  for (const idx of trace.reads ?? []) {
+    reads.add(`leaf:${idx}`);
+  }
+  for (const w of trace.writes ?? []) {
+    writes.add(`leaf:${w.index}`);
+  }
+  for (const rec of trace.getRecords ?? []) {
+    if (!rec || !Array.isArray(rec.hash)) continue;
+    reads.add(`record:${recordKey(rec.hash)}`);
+  }
+  for (const rec of trace.updateRecords ?? []) {
+    if (!rec || !Array.isArray(rec.hash)) continue;
+    writes.add(`record:${recordKey(rec.hash)}`);
+  }
+  return { reads, writes };
+}
+
+function withMerkleSessionDisabled<T>(fn: () => T): T {
+  const g = globalThis as any;
+  const prev = g.__MERKLE_SESSION;
+  g.__MERKLE_SESSION = null;
+  try {
+    return fn();
+  } finally {
+    g.__MERKLE_SESSION = prev;
+  }
+}
+
+class PreexecPool {
+  private workers: NodeWorker[];
+  private idle: NodeWorker[];
+  private queue: Array<{ req: PreexecRequest; resolve: (resp: PreexecResponse) => void; reject: (err: Error) => void }> = [];
+  private inflight: Map<number, { resolve: (resp: PreexecResponse) => void; reject: (err: Error) => void }> = new Map();
+
+  constructor(private workerUrl: URL, size: number) {
+    const n = Number.isFinite(size) && size > 0 ? Math.floor(size) : 1;
+    this.workers = [];
+    this.idle = [];
+    for (let i = 0; i < n; i++) {
+      const w = new NodeWorker(workerUrl, { type: "module" } as any);
+      w.on("message", (msg: PreexecResponse) => {
+        const pending = this.inflight.get(msg.id);
+        if (!pending) return;
+        this.inflight.delete(msg.id);
+        this.idle.push(w);
+        pending.resolve(msg);
+        this.drain();
+      });
+      w.on("error", (err) => {
+        // bubble errors to all inflight tasks
+        for (const [, pending] of this.inflight) {
+          pending.reject(err instanceof Error ? err : new Error(String(err)));
+        }
+        this.inflight.clear();
+      });
+      this.workers.push(w);
+      this.idle.push(w);
+    }
+  }
+
+  exec(req: PreexecRequest): Promise<PreexecResponse> {
+    return new Promise((resolve, reject) => {
+      this.queue.push({ req, resolve, reject });
+      this.drain();
+    });
+  }
+
+  private drain() {
+    while (this.idle.length > 0 && this.queue.length > 0) {
+      const w = this.idle.pop()!;
+      const task = this.queue.shift()!;
+      this.inflight.set(task.req.id, { resolve: task.resolve, reject: task.reject });
+      w.postMessage(task.req);
+    }
+  }
+
+  async close(): Promise<void> {
+    await Promise.all(this.workers.map((w) => w.terminate()));
+  }
+}
+
+type PendingJob = {
+  job: Job;
+  resolve: (value: unknown) => void;
+  reject: (err: unknown) => void;
+};
+
+class OptimisticSequencer {
+  private pool: PreexecPool;
+  private pending: PendingJob[] = [];
+  private flushing = false;
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private nextId = 1;
+  private rootBytes: number[];
+  private bundleTxCount = 0;
+
+  constructor(private service: Service) {
+    this.pool = new PreexecPool(new URL("./preexec/preexec_worker.js", import.meta.url), OPTIMISTIC_WORKERS);
+    this.rootBytes = rootU64ToBytes(service.merkleRoot);
+  }
+
+  enqueue(job: Job): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      this.pending.push({ job, resolve, reject });
+      this.scheduleFlush();
+    });
+  }
+
+  private scheduleFlush() {
+    if (this.flushing) return;
+    if (this.pending.length >= OPTIMISTIC_BATCH) {
+      void this.flush();
+      return;
+    }
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      void this.flush();
+    }, OPTIMISTIC_FLUSH_MS);
+  }
+
+  private async flush() {
+    if (this.flushing) return;
+    this.flushing = true;
+    try {
+      while (this.pending.length > 0) {
+        const batch = this.pending.splice(0, OPTIMISTIC_BATCH);
+        const snapshotRoot = bytes32ToRootU64(this.rootBytes);
+        const rootArr = Array.from(snapshotRoot);
+
+        const preexecs = await Promise.all(
+          batch.map((p) =>
+            this.pool.exec({
+              id: this.nextId++,
+              root: rootArr,
+              signature: (p.job.data as any).value as TxWitness,
+              skipVerify: (p.job.data as any).verified === true,
+            }),
+          ),
+        );
+
+        const unionWrites = new Set<string>();
+        const unionReads = new Set<string>();
+        const deferred: PendingJob[] = [];
+        const chosen: Array<{ p: PendingJob; resp: PreexecOk; isReplay: boolean }> = [];
+
+        for (let i = 0; i < batch.length; i++) {
+          const p = batch[i]!;
+          const resp = preexecs[i]!;
+          if (!resp.ok) {
+            p.reject(new Error(resp.error));
+            continue;
+          }
+
+          const { reads, writes } = buildRwSets(resp.trace);
+          const conflict =
+            intersects(writes, unionWrites) ||
+            intersects(reads, unionWrites) ||
+            intersects(writes, unionReads);
+
+          const errCode = resp.result?.[0] ?? 0n;
+          const isOk = typeof errCode === "bigint" ? errCode === 0n : BigInt(errCode) === 0n;
+
+          if (conflict) {
+            deferred.push(p);
+            continue;
+          }
+
+          if (!isOk) {
+            // If it doesn't depend on prior writes (no conflict), treat it as permanent failure.
+            const errorMsg = application.decode_error(Number(errCode));
+            p.reject(new Error(errorMsg));
+            continue;
+          }
+
+          chosen.push({ p, resp, isReplay: p.job.name === "replay" });
+          for (const r of reads) unionReads.add(r);
+          for (const w of writes) unionWrites.add(w);
+        }
+
+        // Put deferred jobs back to the head to preserve fairness.
+        this.pending = deferred.concat(this.pending);
+
+        let cursor = 0;
+        while (cursor < chosen.length) {
+          const remainingInBundle = OPTIMISTIC_BUNDLE_SIZE - this.bundleTxCount;
+          const take = Math.min(remainingInBundle, chosen.length - cursor);
+          const segment = chosen.slice(cursor, cursor + take);
+          cursor += take;
+
+          let roots: number[][];
+          try {
+            const txs = segment.map((item) => ({
+              writes: item.resp.trace.writes ?? [],
+              updateRecords: item.resp.trace.updateRecords ?? [],
+            }));
+            roots = withMerkleSessionDisabled(() => apply_txs(this.rootBytes, txs));
+            if (!Array.isArray(roots) || roots.length !== segment.length) {
+              throw new Error(`apply_txs returned ${Array.isArray(roots) ? roots.length : typeof roots} roots, expected ${segment.length}`);
+            }
+          } catch (e) {
+            for (const item of segment) {
+              item.p.reject(e);
+            }
+            break;
+          }
+
+          for (let i = 0; i < segment.length; i++) {
+            const item = segment[i]!;
+            const signature = (item.p.job.data as any).value as TxWitness;
+            const jobId = item.p.job.id;
+            try {
+              const events = new BigUint64Array(item.resp.result);
+              this.rootBytes = roots[i]!;
+              this.service.optimisticHeadRoot = bytes32ToRootU64(this.rootBytes);
+              await this.service.optimisticInstall(signature, jobId, events, item.isReplay);
+              item.p.resolve(await this.buildJobResult(item.p.job, signature));
+
+              this.bundleTxCount += 1;
+              if (this.bundleTxCount >= OPTIMISTIC_BUNDLE_SIZE) {
+                await this.flushBundle(this.rootBytes);
+                this.bundleTxCount = 0;
+              }
+            } catch (e) {
+              item.p.reject(e);
+            }
+          }
+        }
+
+        if (chosen.length === 0) {
+          // All jobs in this batch were either failed or deferred; yield to allow more enqueues.
+          break;
+        }
+      }
+    } finally {
+      this.flushing = false;
+      if (this.flushTimer) {
+        clearTimeout(this.flushTimer);
+        this.flushTimer = null;
+      }
+      if (this.pending.length > 0) {
+        this.scheduleFlush();
+      }
+    }
+  }
+
+  private async flushBundle(postRootBytes: number[]) {
+    const postRootU64 = bytes32ToRootU64(postRootBytes);
+
+    // Track bundle using pre-root (service.merkleRoot), then advance to post-root.
+    await this.service.trackBundle("");
+
+    const bundledTxs = transactions_witness;
+    this.service.preMerkleRoot = this.service.merkleRoot;
+    this.service.merkleRoot = postRootU64;
+    this.service.optimisticHeadRoot = this.service.merkleRoot;
+
+    await this.service.txBatched(
+      bundledTxs,
+      merkleRootToBeHexString(this.service.preMerkleRoot),
+      merkleRootToBeHexString(this.service.merkleRoot),
+    );
+
+    transactions_witness = new Array();
+
+    if (process.env.RELOAD_WASM_ON_BUNDLE === "1") {
+      await (initApplication as any)(bootstrap);
+    }
+    application.initialize(this.service.merkleRoot);
+    await this.service.txManager.moveToCommit(merkleRootToBeHexString(this.service.merkleRoot));
+
+    if (this.service.mongoWriteBuffer) {
+      await this.service.mongoWriteBuffer.flush("bundle");
+    }
+  }
+
+  private async buildJobResult(job: Job, signature: TxWitness) {
+    if (LIGHT_JOB_RESULT) {
+      return { bundle: this.service.txManager.currentUncommitMerkleRoot };
+    }
+    // Sync wasm instance to the latest root before serving get_state/snapshot.
+    application.initialize(bytes32ToRootU64(this.rootBytes));
+    if (!DISABLE_SNAPSHOT) {
+      snapshot = JSON.parse(application.snapshot());
+    }
+
+    let player = null;
+    if (job.name !== "replay") {
+      const pkx = new LeHexBN(signature.pkx).toU64Array();
+      player = JSON.parse(application.get_state(pkx));
+    }
+    return {
+      player,
+      state: snapshot,
+      bundle: this.service.txManager.currentUncommitMerkleRoot,
+    };
+  }
+}
 
 function shardForPkx(pkx: string, shardCount: number): number {
   if (shardCount <= 1) return 0;
@@ -138,6 +548,8 @@ export class Service {
   blocklist: Map<string, number>;
   mongoWriteBuffer: MongoWriteBuffer | null;
   merkleSession: string | null;
+  optimisticSequencer: OptimisticSequencer | null;
+  optimisticHeadRoot: BigUint64Array | null;
 
   constructor(
       cb: (arg: TxWitness, events: BigUint64Array) => Promise<void> = async (arg: TxWitness, events: BigUint64Array) => {},
@@ -163,6 +575,8 @@ export class Service {
     this.blocklist = new Map();
     this.mongoWriteBuffer = null;
     this.merkleSession = null;
+    this.optimisticSequencer = null;
+    this.optimisticHeadRoot = null;
   }
 
   async syncToLatestMerkelRoot() {
@@ -410,6 +824,43 @@ export class Service {
     return bundled;
   }
 
+  // Optimistic apply path: records tx/commit metadata but does not execute WASM in this process.
+  // The actual state transition is applied from pre-exec traces (Merkle leaf/record writes).
+  async optimisticInstall(tx: TxWitness, jobid: string | undefined, events: BigUint64Array, isReplay = false): Promise<boolean> {
+    transactions_witness.push(tx);
+
+    const handled = await this.txManager.insertTxIntoCommit(tx, isReplay);
+    if (handled === false) {
+      await this.txCallback(tx, events);
+    }
+
+    if (!isReplay && !DISABLE_MONGO_TX_STORE) {
+      if (this.mongoWriteBuffer) {
+        this.mongoWriteBuffer.enqueueTx({
+          msg: tx.msg,
+          pkx: tx.pkx,
+          sigx: tx.sigx,
+        });
+      } else {
+        const txRecord = new modelTx({
+          msg: tx.msg,
+          pkx: tx.pkx,
+          sigx: tx.sigx,
+        });
+        if (ASYNC_MONGO_WRITES) {
+          void txRecord.save().catch((e) => {
+            console.log("fatal: store tx failed ... process will terminate", e);
+            process.exit(1);
+          });
+        } else {
+          await txRecord.save();
+        }
+      }
+    }
+
+    return false;
+  }
+
   async initialize() {
     await mongoose.connect(get_mongoose_db(), {
       //useNewUrlParser: true,
@@ -554,6 +1005,17 @@ export class Service {
 
     // update the merkle root variable
     this.merkleRoot = application.query_root();
+    this.optimisticHeadRoot = this.merkleRoot;
+
+    if (OPTIMISTIC_APPLY) {
+      console.log("optimistic apply enabled", {
+        workers: OPTIMISTIC_WORKERS,
+        batch: OPTIMISTIC_BATCH,
+        flushMs: OPTIMISTIC_FLUSH_MS,
+        bundleSize: OPTIMISTIC_BUNDLE_SIZE,
+      });
+      this.optimisticSequencer = new OptimisticSequencer(this);
+    }
 
     // Automatically add a job to the queue every few seconds
     if (!DISABLE_AUTOTICK && application.autotick()) {
@@ -593,6 +1055,35 @@ export class Service {
       // console.log(`[${getTimestamp()}] Worker started processing job: ${job.name}, id: ${job.id}`);
       
       if (job.name == 'autoJob') {
+        if (OPTIMISTIC_APPLY) {
+          try {
+            let rand = await generateRandomSeed();
+            if (this.optimisticHeadRoot) {
+              application.initialize(this.optimisticHeadRoot);
+            }
+            let oldSeed = application.randSeed();
+
+            let seed = 0n;
+            if (oldSeed != 0n) {
+              const randRecord = await modelRand.find({
+                commitment: oldSeed.toString(),
+              });
+              seed = randRecord[0].seed!.readBigInt64LE();
+            }
+
+            const signature = sign(createCommand(0n, 0n, [seed, rand, 0n, 0n]), get_server_admin_key());
+            await myQueue.add('transaction', { value: signature, verified: true });
+            return { enqueued: true };
+          } catch (error) {
+            const jobEndTime = performance.now();
+            console.log(`[${getTimestamp()}] AutoJob failed after ${jobEndTime - jobStartTime}ms:`, error);
+            if (AUTOJOB_FATAL) {
+              console.log("fatal: handling auto tick error, process will terminate.", error);
+              process.exit(1);
+            }
+            throw error;
+          }
+        }
         // console.log(`[${getTimestamp()}] AutoJob tick started`);
         try {
           const randStartTime = performance.now();
@@ -663,6 +1154,51 @@ export class Service {
           console.log(`[${getTimestamp()}] AutoJob completed in ${jobEndTime - jobStartTime}ms`);
         }
       } else if (job.name == 'transaction' || job.name == 'replay') {
+        if (OPTIMISTIC_APPLY) {
+          if (!this.optimisticSequencer) {
+            throw new Error("optimistic apply enabled but sequencer not initialized");
+          }
+          try {
+            const signature = job.data.value;
+            const result = await this.optimisticSequencer.enqueue(job);
+            if (job.name != 'replay' && !DISABLE_MONGO_JOB_STORE) {
+              if (this.mongoWriteBuffer) {
+                this.mongoWriteBuffer.enqueueJob({
+                  jobId: (signature as any).hash + (signature as any).pkx,
+                  message: (signature as any).message,
+                  result: "succeed",
+                });
+              } else {
+                const jobRecord = new modelJob({
+                  jobId: (signature as any).hash + (signature as any).pkx,
+                  message: (signature as any).message,
+                  result: "succeed",
+                });
+                if (ASYNC_MONGO_WRITES) {
+                  void jobRecord.save().catch((e) => {
+                    console.log("Error: store transaction job error", e);
+                  });
+                } else {
+                  try {
+                    await jobRecord.save();
+                  } catch (e) {
+                    console.log("Error: store transaction job error", e);
+                    throw e;
+                  }
+                }
+              }
+            }
+            return result;
+          } catch (e) {
+            const jobEndTime = performance.now();
+            console.log(`[${getTimestamp()}] ${job.name} failed after ${jobEndTime - jobStartTime}ms:`, e);
+            const pkx = job.data.value.pkx;
+            const fc = this.blocklist.get(pkx) || 0;
+            this.blocklist.set(pkx, fc + 1);
+            console.log("error optimistic apply", e);
+            throw e;
+          }
+        }
         if (LOG_TX) {
           console.log("handle transaction ...");
         }
@@ -861,6 +1397,12 @@ export class Service {
       //console.log("receive query command on: ", value.pkx);
 
       try {
+        if (OPTIMISTIC_APPLY && this.optimisticHeadRoot) {
+          application.initialize(this.optimisticHeadRoot);
+          if (!DISABLE_SNAPSHOT) {
+            snapshot = JSON.parse(application.snapshot());
+          }
+        }
         const pkx = new LeHexBN(value.pkx).toU64Array();
         let u64array = new BigUint64Array(4);
         u64array.set(pkx);

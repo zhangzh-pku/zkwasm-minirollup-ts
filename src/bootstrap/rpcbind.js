@@ -59,6 +59,34 @@ function getMerkleSession() {
   return session;
 }
 
+function traceOnlyWritesEnabled() {
+  return globalThis.__MERKLE_TRACE_ONLY_WRITES === true;
+}
+
+function getMerkleOverlay() {
+  const overlay = globalThis.__MERKLE_TRACE_OVERLAY;
+  if (!overlay || typeof overlay !== 'object') return null;
+  return overlay;
+}
+
+function overlayGet(overlay, kind, key) {
+  if (!overlay) return undefined;
+  const store = overlay[kind];
+  if (!store) return undefined;
+  if (store instanceof Map) return store.get(key);
+  return store[key];
+}
+
+function overlaySet(overlay, kind, key, value) {
+  if (!overlay) return;
+  const store = overlay[kind];
+  if (store instanceof Map) {
+    store.set(key, value);
+  } else if (store && typeof store === 'object') {
+    store[key] = value;
+  }
+}
+
 function withSession(params) {
   const session = getMerkleSession();
   if (!session) return params;
@@ -102,6 +130,17 @@ function async_get_leaf(root, index) {
 }
 
 export function get_leaf(root, index) {
+  const overlay = getMerkleOverlay();
+  const indexKey = index.toString();
+  const overlayLeaf = overlayGet(overlay, "leaves", indexKey);
+  if (overlayLeaf !== undefined) {
+    const trace = getMerkleTrace();
+    if (trace) {
+      if (!Array.isArray(trace.reads)) trace.reads = [];
+      trace.reads.push(indexKey);
+    }
+    return overlayLeaf;
+  }
   const start = performance.now();
   let data = async_get_leaf(root, index);
   const end = performance.now();
@@ -138,7 +177,14 @@ function async_update_leaf(root, index, data) {
 }
 export function update_leaf(root, index, data) {
   const start = performance.now();
-  let r = async_update_leaf(root, index, data);
+  let r;
+  if (traceOnlyWritesEnabled()) {
+    const overlay = getMerkleOverlay();
+    overlaySet(overlay, "leaves", index.toString(), hash2array(data));
+    r = hash2array(root);
+  } else {
+    r = async_update_leaf(root, index, data);
+  }
   const end = performance.now();
   let lag = end - start;
   //console.log("bench-log: update_leaf", lag);
@@ -175,7 +221,14 @@ function async_update_record(hash, data) {
 
 export function update_record(hash, data) {
   const start = performance.now();
-  let r = async_update_record(hash, data);
+  let r;
+  if (traceOnlyWritesEnabled()) {
+    const overlay = getMerkleOverlay();
+    overlaySet(overlay, "records", hash2array(hash).join(","), data);
+    r = true;
+  } else {
+    r = async_update_record(hash, data);
+  }
   const end = performance.now();
   let lag = end - start;
   //console.log("bench-log: update_record", lag);
@@ -187,6 +240,33 @@ export function update_record(hash, data) {
       data: bigintArray2array(data),
     });
   }
+  return r;
+}
+
+function async_apply_txs(root, txs) {
+  let roothash = hash2array(root);
+  const requestData = {
+    jsonrpc: '2.0',
+    method: 'apply_txs',
+    params: withSession({ root: roothash, txs }),
+    id: 9
+  };
+  let responseStr = requestMerkle(requestData);
+  const response = JSON.parse(responseStr);
+  if (response.error==undefined) {
+    return response.result;
+  } else {
+    console.error('Failed to apply_txs:', response.error);
+    throw("Failed to apply_txs");
+  }
+}
+
+export function apply_txs(root, txs) {
+  const start = performance.now();
+  let r = async_apply_txs(root, txs);
+  const end = performance.now();
+  let lag = end - start;
+  //console.log("bench-log: apply_txs", lag);
   return r;
 }
 
@@ -212,6 +292,18 @@ function async_get_record(hash) {
 }
 
 export function get_record(hash) {
+  const overlay = getMerkleOverlay();
+  const overlayRecord = overlayGet(overlay, "records", hash2array(hash).join(","));
+  if (overlayRecord !== undefined) {
+    const trace = getMerkleTrace();
+    if (trace) {
+      if (!Array.isArray(trace.getRecords)) trace.getRecords = [];
+      trace.getRecords.push({
+        hash: hash2array(hash),
+      });
+    }
+    return overlayRecord;
+  }
   const start = performance.now();
   let r = async_get_record(hash);
   const end = performance.now();
