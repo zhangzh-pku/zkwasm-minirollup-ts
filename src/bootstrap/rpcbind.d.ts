@@ -16,6 +16,30 @@ export function apply_txs(
   }>,
 ): number[][];
 
+export function apply_txs_final(
+  root: Uint8Array | number[],
+  txs: Array<{
+    writes: Array<{ index: string; data: Uint8Array | number[] }>;
+    updateRecords: Array<{ hash: Uint8Array | number[]; data: string[] }>;
+  }>,
+): number[];
+
+export function apply_txs_async(
+  root: Uint8Array | number[],
+  txs: Array<{
+    writes: Array<{ index: string; data: Uint8Array | number[] }>;
+    updateRecords: Array<{ hash: Uint8Array | number[]; data: string[] }>;
+  }>,
+): Promise<number[][]>;
+
+export function apply_txs_final_async(
+  root: Uint8Array | number[],
+  txs: Array<{
+    writes: Array<{ index: string; data: Uint8Array | number[] }>;
+    updateRecords: Array<{ hash: Uint8Array | number[]; data: string[] }>;
+  }>,
+): Promise<number[]>;
+
 export function begin_session(): string;
 export function drop_session(session: string): boolean;
 export function reset_session(session: string): boolean;

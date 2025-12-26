@@ -113,11 +113,18 @@ if (!parentPort) {
   throw new Error("preexec_worker must run as a Worker");
 }
 
+const PREEXEC_REUSE_INITIALIZE = process.env.PREEXEC_REUSE_INITIALIZE === "1";
+let lastRootKey: string | null = null;
+
 parentPort.on("message", (msg: PreexecRequest) => {
   void (async () => {
     try {
-      const root = new BigUint64Array(msg.root);
-      application.initialize(root);
+      const rootKey = msg.root.join(",");
+      if (!PREEXEC_REUSE_INITIALIZE || lastRootKey !== rootKey) {
+        const root = new BigUint64Array(msg.root);
+        application.initialize(root);
+        lastRootKey = rootKey;
+      }
 
       const u64array = signature_to_u64array(msg.signature);
       const timingMs: PreexecOk["timingMs"] = { handleTx: 0 };

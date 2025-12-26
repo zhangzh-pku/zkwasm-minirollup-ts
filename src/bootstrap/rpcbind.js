@@ -47,6 +47,21 @@ function requestMerkle(requestData) {
   return requestMerkleData(requestData);
 }
 
+async function requestMerkleAsync(requestData) {
+  if (MERKLE_RPC_MODE === 'mock') {
+    return JSON.parse(requestMerkle(requestData));
+  }
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestData),
+  });
+  if (!resp.ok) {
+    throw new Error(`merkle rpc failed: ${resp.status}`);
+  }
+  return await resp.json();
+}
+
 function getMerkleTrace() {
   const trace = globalThis.__MERKLE_TRACE;
   if (!trace || typeof trace !== 'object') return null;
@@ -268,6 +283,67 @@ export function apply_txs(root, txs) {
   let lag = end - start;
   //console.log("bench-log: apply_txs", lag);
   return r;
+}
+
+function async_apply_txs_final(root, txs) {
+  let roothash = hash2array(root);
+  const requestData = {
+    jsonrpc: '2.0',
+    method: 'apply_txs_final',
+    params: withSession({ root: roothash, txs }),
+    id: 10,
+  };
+  let responseStr = requestMerkle(requestData);
+  const response = JSON.parse(responseStr);
+  if (response.error==undefined) {
+    return response.result;
+  } else {
+    console.error('Failed to apply_txs_final:', response.error);
+    throw("Failed to apply_txs_final");
+  }
+}
+
+export function apply_txs_final(root, txs) {
+  const start = performance.now();
+  let r = async_apply_txs_final(root, txs);
+  const end = performance.now();
+  let lag = end - start;
+  //console.log("bench-log: apply_txs_final", lag);
+  return r;
+}
+
+export async function apply_txs_async(root, txs) {
+  let roothash = hash2array(root);
+  const requestData = {
+    jsonrpc: '2.0',
+    method: 'apply_txs',
+    params: withSession({ root: roothash, txs }),
+    id: 11,
+  };
+  const response = await requestMerkleAsync(requestData);
+  if (response.error == undefined) {
+    return response.result;
+  } else {
+    console.error('Failed to apply_txs_async:', response.error);
+    throw new Error('Failed to apply_txs_async');
+  }
+}
+
+export async function apply_txs_final_async(root, txs) {
+  let roothash = hash2array(root);
+  const requestData = {
+    jsonrpc: '2.0',
+    method: 'apply_txs_final',
+    params: withSession({ root: roothash, txs }),
+    id: 12,
+  };
+  const response = await requestMerkleAsync(requestData);
+  if (response.error == undefined) {
+    return response.result;
+  } else {
+    console.error('Failed to apply_txs_final_async:', response.error);
+    throw new Error('Failed to apply_txs_final_async');
+  }
 }
 
 function async_get_record(hash) {

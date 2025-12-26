@@ -1,6 +1,14 @@
 //import initHostBind, * as hostbind from "./wasmbind/hostbind.js";
 import initBootstrap, * as bootstrap from "./bootstrap/bootstrap.js";
-import { apply_txs, begin_session, commit_session, drop_session } from "./bootstrap/rpcbind.js";
+import {
+  apply_txs,
+  apply_txs_async,
+  apply_txs_final,
+  apply_txs_final_async,
+  begin_session,
+  commit_session,
+  drop_session,
+} from "./bootstrap/rpcbind.js";
 import initApplication, * as application from "./application/application.js";
 import { test_merkle_db_service } from "./test.js";
 import { LeHexBN, sign, PlayerConvention, ZKWasmAppRpc, createCommand } from "zkwasm-minirollup-rpc";
@@ -32,6 +40,7 @@ const LOG_TX = process.env.LOG_TX === '1';
 const LOG_BUNDLE = process.env.LOG_BUNDLE === '1';
 const LOG_QUEUE_STATS = process.env.LOG_QUEUE_STATS === '1';
 const LOG_AUTOJOB = process.env.LOG_AUTOJOB === '1';
+const LOG_OPTIMISTIC = process.env.LOG_OPTIMISTIC === '1';
 const DISABLE_AUTOTICK = process.env.DISABLE_AUTOTICK === '1';
 const AUTOJOB_FATAL = process.env.AUTOJOB_FATAL === '1';
 const DISABLE_SNAPSHOT = process.env.DISABLE_SNAPSHOT === '1';
@@ -70,6 +79,18 @@ const OPTIMISTIC_BUNDLE_SIZE = (() => {
   const raw = Number.parseInt(process.env.OPTIMISTIC_BUNDLE_SIZE ?? "100", 10);
   if (Number.isFinite(raw) && raw > 0) return raw;
   return 100;
+})();
+const OPTIMISTIC_SERIAL_THRESHOLD = (() => {
+  const raw = Number.parseFloat(process.env.OPTIMISTIC_SERIAL_THRESHOLD ?? "0.25");
+  if (!Number.isFinite(raw)) return 0.25;
+  if (raw < 0) return 0;
+  if (raw > 1) return 1;
+  return raw;
+})();
+const OPTIMISTIC_SERIAL_COOLDOWN_MS = (() => {
+  const raw = Number.parseInt(process.env.OPTIMISTIC_SERIAL_COOLDOWN_MS ?? "1000", 10);
+  if (Number.isFinite(raw) && raw >= 0) return raw;
+  return 1000;
 })();
 
 type PreexecTrace = {
@@ -184,6 +205,17 @@ function withMerkleSessionDisabled<T>(fn: () => T): T {
   }
 }
 
+async function withMerkleSessionDisabledAsync<T>(fn: () => Promise<T>): Promise<T> {
+  const g = globalThis as any;
+  const prev = g.__MERKLE_SESSION;
+  g.__MERKLE_SESSION = null;
+  try {
+    return await fn();
+  } finally {
+    g.__MERKLE_SESSION = prev;
+  }
+}
+
 class PreexecPool {
   private workers: NodeWorker[];
   private idle: NodeWorker[];
@@ -251,6 +283,7 @@ class OptimisticSequencer {
   private nextId = 1;
   private rootBytes: number[];
   private bundleTxCount = 0;
+  private serialUntilMs = 0;
 
   constructor(private service: Service) {
     this.pool = new PreexecPool(new URL("./preexec/preexec_worker.js", import.meta.url), OPTIMISTIC_WORKERS);
@@ -282,6 +315,20 @@ class OptimisticSequencer {
     this.flushing = true;
     try {
       while (this.pending.length > 0) {
+        if (OPTIMISTIC_SERIAL_COOLDOWN_MS > 0 && Date.now() < this.serialUntilMs) {
+          const batch = this.pending.splice(0, OPTIMISTIC_BATCH);
+          for (const p of batch) {
+            try {
+              const result = await this.applySerial(p);
+              p.resolve(result);
+            } catch (e) {
+              p.reject(e);
+            }
+          }
+          if (batch.length === 0) break;
+          continue;
+        }
+
         const batch = this.pending.splice(0, OPTIMISTIC_BATCH);
         const snapshotRoot = bytes32ToRootU64(this.rootBytes);
         const rootArr = Array.from(snapshotRoot);
@@ -336,9 +383,6 @@ class OptimisticSequencer {
           for (const w of writes) unionWrites.add(w);
         }
 
-        // Put deferred jobs back to the head to preserve fairness.
-        this.pending = deferred.concat(this.pending);
-
         let cursor = 0;
         while (cursor < chosen.length) {
           const remainingInBundle = OPTIMISTIC_BUNDLE_SIZE - this.bundleTxCount;
@@ -346,15 +390,27 @@ class OptimisticSequencer {
           const segment = chosen.slice(cursor, cursor + take);
           cursor += take;
 
-          let roots: number[][];
+          let roots: number[][] = [];
+          let finalRootBytes: number[] | null = null;
           try {
             const txs = segment.map((item) => ({
               writes: item.resp.trace.writes ?? [],
               updateRecords: item.resp.trace.updateRecords ?? [],
             }));
-            roots = withMerkleSessionDisabled(() => apply_txs(this.rootBytes, txs));
-            if (!Array.isArray(roots) || roots.length !== segment.length) {
-              throw new Error(`apply_txs returned ${Array.isArray(roots) ? roots.length : typeof roots} roots, expected ${segment.length}`);
+            if (LIGHT_JOB_RESULT) {
+              finalRootBytes = await withMerkleSessionDisabledAsync(() => apply_txs_final_async(this.rootBytes, txs));
+              if (!Array.isArray(finalRootBytes) || finalRootBytes.length !== 32) {
+                throw new Error(
+                  `apply_txs_final returned ${Array.isArray(finalRootBytes) ? finalRootBytes.length : typeof finalRootBytes} bytes, expected 32`,
+                );
+              }
+            } else {
+              roots = await withMerkleSessionDisabledAsync(() => apply_txs_async(this.rootBytes, txs));
+              if (!Array.isArray(roots) || roots.length !== segment.length) {
+                throw new Error(
+                  `apply_txs returned ${Array.isArray(roots) ? roots.length : typeof roots} roots, expected ${segment.length}`,
+                );
+              }
             }
           } catch (e) {
             for (const item of segment) {
@@ -363,14 +419,21 @@ class OptimisticSequencer {
             break;
           }
 
+          if (finalRootBytes) {
+            this.rootBytes = finalRootBytes;
+            this.service.optimisticHeadRoot = bytes32ToRootU64(this.rootBytes);
+          }
+
           for (let i = 0; i < segment.length; i++) {
             const item = segment[i]!;
             const signature = (item.p.job.data as any).value as TxWitness;
             const jobId = item.p.job.id;
             try {
               const events = new BigUint64Array(item.resp.result);
-              this.rootBytes = roots[i]!;
-              this.service.optimisticHeadRoot = bytes32ToRootU64(this.rootBytes);
+              if (!finalRootBytes) {
+                this.rootBytes = roots[i]!;
+                this.service.optimisticHeadRoot = bytes32ToRootU64(this.rootBytes);
+              }
               await this.service.optimisticInstall(signature, jobId, events, item.isReplay);
               item.p.resolve(await this.buildJobResult(item.p.job, signature));
 
@@ -385,8 +448,33 @@ class OptimisticSequencer {
           }
         }
 
-        if (chosen.length === 0) {
-          // All jobs in this batch were either failed or deferred; yield to allow more enqueues.
+        for (const p of deferred) {
+          try {
+            const result = await this.applySerial(p);
+            p.resolve(result);
+          } catch (e) {
+            p.reject(e);
+          }
+        }
+
+        const considered = chosen.length + deferred.length;
+        if (considered > 0) {
+          const ratio = chosen.length / considered;
+          if (deferred.length > 0 && ratio < OPTIMISTIC_SERIAL_THRESHOLD) {
+            this.serialUntilMs = Date.now() + OPTIMISTIC_SERIAL_COOLDOWN_MS;
+            if (LOG_OPTIMISTIC) {
+              console.log("optimistic apply: high conflict, switching to serial fallback", {
+                ratio: ratio.toFixed(3),
+                chosen: chosen.length,
+                deferred: deferred.length,
+                cooldownMs: OPTIMISTIC_SERIAL_COOLDOWN_MS,
+              });
+            }
+          }
+        }
+
+        if (considered === 0) {
+          // All jobs in this batch failed during preexec; yield to allow more enqueues.
           break;
         }
       }
@@ -452,6 +540,37 @@ class OptimisticSequencer {
       state: snapshot,
       bundle: this.service.txManager.currentUncommitMerkleRoot,
     };
+  }
+
+  private async applySerial(p: PendingJob): Promise<unknown> {
+    const signature = (p.job.data as any).value as TxWitness;
+    const u64array = signature_to_u64array(signature);
+
+    application.initialize(bytes32ToRootU64(this.rootBytes));
+
+    if (!(p.job.name === "transaction" && (p.job.data as any).verified === true)) {
+      application.verify_tx_signature(u64array);
+    }
+
+    const txResult = withMerkleSessionDisabled(() => application.handle_tx(u64array));
+    const errorCode = txResult[0];
+    if (errorCode !== 0n) {
+      throw new Error(application.decode_error(Number(errorCode)));
+    }
+
+    const postRoot = application.query_root();
+    this.rootBytes = rootU64ToBytes(postRoot);
+    this.service.optimisticHeadRoot = postRoot;
+
+    await this.service.optimisticInstall(signature, p.job.id, txResult, p.job.name === "replay");
+
+    this.bundleTxCount += 1;
+    if (this.bundleTxCount >= OPTIMISTIC_BUNDLE_SIZE) {
+      await this.flushBundle(this.rootBytes);
+      this.bundleTxCount = 0;
+    }
+
+    return await this.buildJobResult(p.job, signature);
   }
 }
 
