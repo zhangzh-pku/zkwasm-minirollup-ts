@@ -5,6 +5,37 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+function clampInt(value: unknown, fallback: number): number {
+  if (typeof value !== "string" || value.length === 0) return fallback;
+  const n = Number.parseInt(value, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.floor(n);
+}
+
+export const get_shard_count = () => {
+  const n = clampInt(process.env.SHARD_COUNT, 1);
+  return n > 0 ? n : 1;
+}
+
+export const get_shard_id = () => {
+  const n = clampInt(process.env.SHARD_ID, 0);
+  return n >= 0 ? n : 0;
+}
+
+export const get_queue_prefix = () => {
+  return process.env.QUEUE_PREFIX ?? "sequencer";
+}
+
+export const get_queue_name = () => {
+  const shardCount = get_shard_count();
+  const shardId = get_shard_id();
+  const prefix = get_queue_prefix();
+  if (shardCount <= 1) return prefix;
+  if (shardId >= shardCount) {
+    throw new Error(`invalid SHARD_ID=${shardId} for SHARD_COUNT=${shardCount}`);
+  }
+  return `${prefix}-${shardId}`;
+}
 
 export const endpoint = "https://rpc.zkwasmhub.com:443";
 
@@ -41,7 +72,10 @@ export const get_mongodb_uri = () => {
 export const get_mongoose_db = () => {
   let mongodbUri = get_mongodb_uri();
   let imageMD5Prefix = get_image_md5();
-  return `${mongodbUri}/${imageMD5Prefix}_job-tracker`
+  const shardCount = get_shard_count();
+  const shardId = get_shard_id();
+  const shardSuffix = shardCount > 1 ? `_shard${shardId}` : "";
+  return `${mongodbUri}/${imageMD5Prefix}_job-tracker${shardSuffix}`
 }
 
 export const get_service_port = () => {
@@ -187,5 +221,4 @@ export const modelBundle = mongoose.model('Bundle', bundleSchema);
 export const modelRand = mongoose.model('Rand', randSchema);
 
 export const ServiceHelper = new ZkWasmServiceHelper(endpoint, "", "");
-
 

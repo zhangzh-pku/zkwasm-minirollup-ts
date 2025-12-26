@@ -6,10 +6,11 @@ import { verifySign, LeHexBN, sign, PlayerConvention, ZKWasmAppRpc, createComman
 import { Queue, Worker, Job } from 'bullmq';
 import IORedis from 'ioredis';
 import express, {Express} from 'express';
+import { createHash } from 'node:crypto';
 import { submitProofWithRetry, has_uncomplete_task, TxWitness, get_latest_proof, has_task } from "./prover.js";
 import { ensureIndexes } from "./commit.js";
 import cors from "cors";
-import { get_mongoose_db, modelBundle, modelJob, modelRand, get_service_port, get_server_admin_key, modelTx, get_contract_addr, get_chain_id } from "./config.js";
+import { get_chain_id, get_contract_addr, get_mongoose_db, get_queue_name, get_shard_count, get_shard_id, get_server_admin_key, get_service_port, modelBundle, modelJob, modelRand, modelTx } from "./config.js";
 import { getMerkleArray } from "./contract.js";
 import { ZkWasmUtil } from "zkwasm-service-helper";
 import dotenv from 'dotenv';
@@ -22,6 +23,16 @@ import {queryAccounts, storeAccount} from "./account.js";
 // Load environment variables from .env file
 dotenv.config();
 
+const ENFORCE_SHARD = process.env.ENFORCE_SHARD !== '0';
+
+function shardForPkx(pkx: string, shardCount: number): number {
+  if (shardCount <= 1) return 0;
+  const hex = pkx.startsWith("0x") ? pkx.slice(2) : pkx;
+  if (!/^[0-9a-fA-F]*$/.test(hex)) return 0;
+  const buf = Buffer.from(hex.length % 2 === 0 ? hex : `0${hex}`, "hex");
+  const digest = createHash("sha256").update(buf).digest();
+  return digest.readUInt32LE(0) % shardCount;
+}
 let deploymode = false;
 let remote = false;
 let migrate = false;
@@ -410,8 +421,11 @@ export class Service {
       await this.syncToLatestMerkelRoot();
     }
 
-    console.log("initialize sequener queue ...");
-    const myQueue = new Queue('sequencer', {connection});
+    const shardCount = get_shard_count();
+    const shardId = get_shard_id();
+    const queueName = get_queue_name();
+    console.log("initialize sequener queue ...", { queueName, shardId, shardCount });
+    const myQueue = new Queue(queueName, {connection});
 
     const waitingCount = await myQueue.getWaitingCount();
     console.log("waiting Count is:", waitingCount, " perform draining ...");
@@ -459,7 +473,7 @@ export class Service {
       }
     }, 2000);
 
-    this.worker = new Worker('sequencer', async job => {
+    this.worker = new Worker(queueName, async job => {
       const jobStartTime = performance.now();
       // console.log(`[${getTimestamp()}] Worker started processing job: ${job.name}, id: ${job.id}`);
       
@@ -601,6 +615,8 @@ export class Service {
     console.log("start express server");
     const app = express();
     const port = get_service_port();
+    const shardCount = get_shard_count();
+    const shardId = get_shard_id();
 
     app.use(express.json());
     app.use(cors());
@@ -621,19 +637,34 @@ export class Service {
         const sigr = new LeHexBN(value.sigr);
         if (verifySign(hash, pkx, pky, sigx, sigy, sigr) == false) {
           console.error('Invalid signature:');
-          res.status(500).send('Invalid signature');
-        } else {
-          const fc = this.blocklist.get(value.pkx) || 0;
-          if (fc > 3) {
-            res.status(500).send('This account is blocked for 1 minutes for multiple incorrect arguments');
-          } else {
-            const job = await this.queue!.add('transaction', { value });
-            res.status(201).send({
-              success: true,
-              jobid: job.id
+          return res.status(500).send('Invalid signature');
+        }
+
+        const fc = this.blocklist.get(value.pkx) || 0;
+        if (fc > 3) {
+          return res
+            .status(500)
+            .send(
+              'This account is blocked for 1 minutes for multiple incorrect arguments'
+            );
+        }
+
+        if (ENFORCE_SHARD && shardCount > 1) {
+          const target = shardForPkx(value.pkx, shardCount);
+          if (target !== shardId) {
+            return res.status(409).send({
+              success: false,
+              error: "WrongShard",
+              shard: target,
             });
           }
         }
+
+        const job = await this.queue!.add('transaction', { value, verified: true });
+        return res.status(201).send({
+          success: true,
+          jobid: job.id
+        });
       } catch (error) {
         console.error('Error adding job to the queue:', error);
         res.status(500).send('Failed to add job to the queue');
