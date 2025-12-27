@@ -17,6 +17,7 @@
     "express": "^4.19.2",
     "ioredis": "^5.4.1",
     "mongoose": "^8.4.4",
+    "msgpackr": "^1.11.8",
     "node-fetch": "^3.3.2",
     "sync-fetch": "^0.5.2",
     "ts-node": "^10.9.2",

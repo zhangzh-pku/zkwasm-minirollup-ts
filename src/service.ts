@@ -102,6 +102,32 @@ const OPTIMISTIC_QUEUE_CONCURRENCY = (() => {
   return 1;
 })();
 
+// /send hot path optimizations: batch enqueue jobs to Redis (BullMQ) to reduce per-request overhead.
+// Defaults to enabled when OPTIMISTIC_APPLY=1, since that mode targets max throughput.
+const SEND_ENQUEUE_BATCH = (() => {
+  const raw = Number.parseInt(process.env.SEND_ENQUEUE_BATCH ?? "", 10);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return OPTIMISTIC_APPLY ? 64 : 1;
+})();
+const SEND_ENQUEUE_FLUSH_MS = (() => {
+  const raw = Number.parseInt(process.env.SEND_ENQUEUE_FLUSH_MS ?? "", 10);
+  if (Number.isFinite(raw) && raw >= 0) return raw;
+  return OPTIMISTIC_APPLY ? 1 : 0;
+})();
+const SEND_ENQUEUE_MAX_PENDING = (() => {
+  const raw = Number.parseInt(process.env.SEND_ENQUEUE_MAX_PENDING ?? "", 10);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return OPTIMISTIC_APPLY ? 20000 : 5000;
+})();
+
+// Increase TCP accept backlog to reduce connection drops under extreme client concurrency.
+const HTTP_HOST = process.env.HTTP_HOST ?? "0.0.0.0";
+const HTTP_BACKLOG = (() => {
+  const raw = Number.parseInt(process.env.HTTP_BACKLOG ?? "", 10);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return 2048;
+})();
+
 type PreexecTrace = {
   reads: string[];
   writes: Array<{ index: string; data: number[] }>;
@@ -222,6 +248,116 @@ async function withMerkleSessionDisabledAsync<T>(fn: () => Promise<T>): Promise<
     return await fn();
   } finally {
     g.__MERKLE_SESSION = prev;
+  }
+}
+
+function txJobId(tx: TxWitness): string | undefined {
+  const hash = (tx as any)?.hash;
+  const pkx = (tx as any)?.pkx;
+  if (typeof hash !== "string" || typeof pkx !== "string") return undefined;
+  return `${hash}${pkx}`;
+}
+
+class OverloadedError extends Error {
+  statusCode: number;
+  constructor(message = "Overloaded") {
+    super(message);
+    this.name = "OverloadedError";
+    this.statusCode = 503;
+  }
+}
+
+type PendingEnqueue = {
+  value: TxWitness;
+  resolve: (job: Job) => void;
+  reject: (err: Error) => void;
+};
+
+class SendEnqueueBuffer {
+  private pending: PendingEnqueue[] = [];
+  private flushing = false;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(
+    private queue: Queue,
+    private batchSize: number,
+    private flushMs: number,
+    private maxPending: number,
+  ) {}
+
+  enqueue(value: TxWitness): Promise<Job> {
+    if (this.pending.length >= this.maxPending) {
+      return Promise.reject(new OverloadedError(`Overloaded: pending=${this.pending.length}, max=${this.maxPending}`));
+    }
+    return new Promise((resolve, reject) => {
+      this.pending.push({ value, resolve, reject });
+      this.scheduleFlush();
+    });
+  }
+
+  private scheduleFlush() {
+    if (this.flushing) return;
+    if (this.pending.length >= this.batchSize) {
+      void this.flush();
+      return;
+    }
+    if (this.timer) return;
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      void this.flush();
+    }, this.flushMs);
+  }
+
+  private async flush(): Promise<void> {
+    if (this.flushing) return;
+    this.flushing = true;
+    try {
+      while (this.pending.length > 0) {
+        const batch = this.pending.splice(0, this.batchSize);
+        try {
+          const bulk = batch.map((item) => ({
+            name: "transaction",
+            data: { value: item.value, verified: true },
+            opts: (() => {
+              const jobId = txJobId(item.value);
+              return jobId ? { jobId } : {};
+            })(),
+          })) as any[];
+          const jobs = (await this.queue.addBulk(bulk)) as unknown as Job[];
+          if (!Array.isArray(jobs) || jobs.length !== batch.length) {
+            throw new Error(
+              `queue.addBulk returned ${Array.isArray(jobs) ? jobs.length : typeof jobs} jobs, expected ${batch.length}`,
+            );
+          }
+          for (let i = 0; i < batch.length; i++) {
+            batch[i]!.resolve(jobs[i]!);
+          }
+        } catch (e) {
+          const err = e instanceof Error ? e : new Error(String(e));
+          for (const item of batch) {
+            item.reject(err);
+          }
+
+          // If enqueue is failing, reject everything pending to avoid unbounded memory growth.
+          if (this.pending.length > 0) {
+            const remaining = this.pending.splice(0, this.pending.length);
+            for (const item of remaining) {
+              item.reject(err);
+            }
+          }
+          break;
+        }
+      }
+    } finally {
+      this.flushing = false;
+      if (this.timer) {
+        clearTimeout(this.timer);
+        this.timer = null;
+      }
+      if (this.pending.length > 0) {
+        this.scheduleFlush();
+      }
+    }
   }
 }
 
@@ -665,6 +801,7 @@ async function generateRandomSeed() {
 export class Service {
   worker: null | Worker;
   queue: null | Queue;
+  sendEnqueueBuffer: SendEnqueueBuffer | null;
   txCallback: (arg: TxWitness, events: BigUint64Array) => Promise<void>;
   txBatched: (arg: TxWitness[], preMerkleHexRoot: string, postMerkleRoot: string ) => Promise<void>;
   playerIndexer: (arg: any) => number;
@@ -687,6 +824,7 @@ export class Service {
   ) {
     this.worker = null;
     this.queue = null;
+    this.sendEnqueueBuffer = null;
     this.txCallback = cb;
     this.txBatched = txBatched;
     this.registerAPICallback = registerAPICallback;
@@ -1124,6 +1262,8 @@ export class Service {
     await myQueue.drain();
 
     this.queue = myQueue;
+    this.sendEnqueueBuffer =
+      SEND_ENQUEUE_BATCH > 1 ? new SendEnqueueBuffer(myQueue, SEND_ENQUEUE_BATCH, SEND_ENQUEUE_FLUSH_MS, SEND_ENQUEUE_MAX_PENDING) : null;
 
     console.log("initialize application merkle db ...");
 
@@ -1445,7 +1585,12 @@ export class Service {
     }
     console.log("start express server");
     const app = express();
-    const port = get_service_port();
+    const port = (() => {
+      const raw = get_service_port();
+      const parsed = Number.parseInt(String(raw), 10);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+      return 3000;
+    })();
     const shardCount = get_shard_count();
     const shardId = get_shard_id();
 
@@ -1488,13 +1633,26 @@ export class Service {
           }
         }
 
-        const job = await this.queue!.add('transaction', { value, verified: true });
+        const job = (() => {
+          if (this.sendEnqueueBuffer !== null) {
+            return this.sendEnqueueBuffer.enqueue(value);
+          }
+          const jobId = txJobId(value);
+          if (jobId) {
+            return this.queue!.add('transaction', { value, verified: true }, { jobId });
+          }
+          return this.queue!.add('transaction', { value, verified: true });
+        })();
         return res.status(201).send({
           success: true,
-          jobid: job.id
+          jobid: (await job).id,
         });
       } catch (error) {
         console.error('Error adding job to the queue:', error);
+        const status = (error as any)?.statusCode;
+        if (typeof status === "number" && status >= 400 && status < 600) {
+          return res.status(status).send((error as Error).message);
+        }
         res.status(500).send('Failed to add job to the queue');
       }
     });
@@ -1685,8 +1843,8 @@ export class Service {
     this.registerAPICallback(app);
 
     // Start the server
-    app.listen(port, () => {
-      console.log(`Server is running on http://0.0.0.0:${port}`);
+    app.listen(port, HTTP_HOST, HTTP_BACKLOG, () => {
+      console.log(`Server is running on http://${HTTP_HOST}:${port}`);
     });
   }
 
