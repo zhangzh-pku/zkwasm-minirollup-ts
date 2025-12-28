@@ -103,6 +103,11 @@ const OPTIMISTIC_QUEUE_CONCURRENCY = (() => {
   return 1;
 })();
 
+// M3: move Merkle commit (apply_txs*) into a dedicated Worker thread, and optionally pipeline
+// preexec of the next batch while committing the current batch.
+const OPTIMISTIC_PIPELINE = process.env.OPTIMISTIC_PIPELINE === "1";
+const OPTIMISTIC_COMMIT_WORKER = OPTIMISTIC_PIPELINE || process.env.OPTIMISTIC_COMMIT_WORKER === "1";
+
 // /send hot path optimizations: batch enqueue jobs to Redis (BullMQ) to reduce per-request overhead.
 // Defaults to enabled when OPTIMISTIC_APPLY=1, since that mode targets max throughput.
 const SEND_ENQUEUE_BATCH = (() => {
@@ -416,6 +421,88 @@ class PreexecPool {
   }
 }
 
+type CommitMode = "final" | "roots";
+
+type ApplyLeafWrite = { index: string; data: number[] };
+type ApplyRecordUpdate = { hash: number[]; data: string[] };
+type ApplyTxTrace = { writes: ApplyLeafWrite[]; updateRecords: ApplyRecordUpdate[] };
+
+type CommitRequest = {
+  id: number;
+  mode: CommitMode;
+  rootBytes: number[];
+  txs: ApplyTxTrace[];
+  session?: string | null;
+};
+
+type CommitOk = {
+  id: number;
+  ok: true;
+  mode: CommitMode;
+  finalRoot?: number[];
+  roots?: number[][];
+  timingMs: {
+    apply: number;
+  };
+};
+
+type CommitErr = {
+  id: number;
+  ok: false;
+  error: string;
+};
+
+type CommitResponse = CommitOk | CommitErr;
+
+class CommitPool {
+  private worker: NodeWorker;
+  private queue: Array<{ req: CommitRequest; resolve: (resp: CommitResponse) => void; reject: (err: Error) => void }> = [];
+  private inflight: Map<number, { resolve: (resp: CommitResponse) => void; reject: (err: Error) => void }> = new Map();
+  private busy = false;
+  private nextId = 1;
+
+  constructor(workerUrl: URL) {
+    this.worker = new NodeWorker(workerUrl, { type: "module" } as any);
+    this.worker.on("message", (msg: CommitResponse) => {
+      const pending = this.inflight.get(msg.id);
+      if (!pending) return;
+      this.inflight.delete(msg.id);
+      pending.resolve(msg);
+      this.busy = false;
+      this.drain();
+    });
+    this.worker.on("error", (err) => {
+      for (const [, pending] of this.inflight) {
+        pending.reject(err instanceof Error ? err : new Error(String(err)));
+      }
+      this.inflight.clear();
+      this.busy = false;
+    });
+  }
+
+  exec(mode: CommitMode, rootBytes: number[], txs: ApplyTxTrace[], session: string | null): Promise<CommitResponse> {
+    const id = this.nextId++;
+    const req: CommitRequest = { id, mode, rootBytes, txs, session };
+    return new Promise((resolve, reject) => {
+      this.queue.push({ req, resolve, reject });
+      this.drain();
+    });
+  }
+
+  private drain() {
+    if (this.busy) return;
+    const task = this.queue.shift();
+    if (!task) return;
+    this.busy = true;
+    this.inflight.set(task.req.id, { resolve: task.resolve, reject: task.reject });
+    this.worker.postMessage(task.req);
+  }
+
+  async close(): Promise<void> {
+    await this.worker.terminate();
+  }
+}
+
 type PendingJob = {
   job: Job;
   resolve: (value: unknown) => void;
@@ -424,6 +511,7 @@ type PendingJob = {
 
 class OptimisticSequencer {
   private pool: PreexecPool;
+  private commit: CommitPool | null;
   private pending: PendingJob[] = [];
   private flushing = false;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -434,6 +522,7 @@ class OptimisticSequencer {
 
   constructor(private service: Service) {
     this.pool = new PreexecPool(new URL("./preexec/preexec_worker.js", import.meta.url), OPTIMISTIC_WORKERS);
+    this.commit = OPTIMISTIC_COMMIT_WORKER ? new CommitPool(new URL("./optimistic/commit_worker.js", import.meta.url)) : null;
     this.rootBytes = rootU64ToBytes(service.merkleRoot);
   }
 
@@ -461,7 +550,16 @@ class OptimisticSequencer {
     if (this.flushing) return;
     this.flushing = true;
     try {
-      while (this.pending.length > 0) {
+      const prefetchEnabled = OPTIMISTIC_PIPELINE && this.commit !== null;
+      let prefetched:
+        | {
+            batch: PendingJob[];
+            preexecs: Promise<PreexecResponse[]>;
+            validateWrites: Set<string>;
+          }
+        | null = null;
+
+      while (this.pending.length > 0 || prefetched) {
         const batchStart = performance.now();
         let preexecWallMs = 0;
         let applyWallMs = 0;
@@ -473,8 +571,16 @@ class OptimisticSequencer {
         let preexecErr = 0;
         let applyWrites = 0;
         let applyUpdateRecords = 0;
+        let validateWritesSize = 0;
+        let validateConflicts = 0;
+        let didPrefetch = false;
 
         if (OPTIMISTIC_SERIAL_COOLDOWN_MS > 0 && Date.now() < this.serialUntilMs) {
+          if (prefetched) {
+            // Do not keep prefetched work while in serial fallback: we must execute on latest root.
+            this.pending = prefetched.batch.concat(this.pending);
+            prefetched = null;
+          }
           const batch = this.pending.splice(0, OPTIMISTIC_BATCH);
           for (const p of batch) {
             try {
@@ -490,22 +596,34 @@ class OptimisticSequencer {
           continue;
         }
 
-        const batch = this.pending.splice(0, OPTIMISTIC_BATCH);
-        const snapshotRoot = bytes32ToRootU64(this.rootBytes);
-        const rootArr = Array.from(snapshotRoot);
+        let batch: PendingJob[] = [];
+        let preexecPromise: Promise<PreexecResponse[]>;
+        let validateWrites = new Set<string>();
+        if (prefetched) {
+          batch = prefetched.batch;
+          preexecPromise = prefetched.preexecs;
+          validateWrites = prefetched.validateWrites;
+          validateWritesSize = validateWrites.size;
+          prefetched = null;
+        } else {
+          batch = this.pending.splice(0, OPTIMISTIC_BATCH);
+          const snapshotRoot = bytes32ToRootU64(this.rootBytes);
+          const rootArr = Array.from(snapshotRoot);
+          preexecPromise = Promise.all(
+            batch.map((p) =>
+              this.pool.exec({
+                id: this.nextId++,
+                root: rootArr,
+                signature: (p.job.data as any).value as TxWitness,
+                skipVerify: (p.job.data as any).verified === true,
+                session: MERKLE_SESSION_OVERLAY ? this.service.merkleSession : null,
+              }),
+            ),
+          );
+        }
 
         const preexecStart = performance.now();
-        const preexecs = await Promise.all(
-          batch.map((p) =>
-            this.pool.exec({
-              id: this.nextId++,
-              root: rootArr,
-              signature: (p.job.data as any).value as TxWitness,
-              skipVerify: (p.job.data as any).verified === true,
-              session: MERKLE_SESSION_OVERLAY ? this.service.merkleSession : null,
-            }),
-          ),
-        );
+        const preexecs = await preexecPromise;
         preexecWallMs += performance.now() - preexecStart;
 
         const unionWrites = new Set<string>();
@@ -528,6 +646,14 @@ class OptimisticSequencer {
           }
 
           const { reads, writes } = buildRwSets(resp.trace);
+          if (validateWritesSize > 0) {
+            const staleConflict = intersects(writes, validateWrites) || intersects(reads, validateWrites);
+            if (staleConflict) {
+              validateConflicts += 1;
+              deferred.push(p);
+              continue;
+            }
+          }
           const conflict =
             intersects(writes, unionWrites) ||
             intersects(reads, unionWrites) ||
@@ -553,6 +679,33 @@ class OptimisticSequencer {
           for (const w of writes) unionWrites.add(w);
         }
 
+        // M3 pipeline: if this batch is fully conflict-free, prefetch the next batch on the current root
+        // (which is about to be advanced), and validate it against this batch's committed write-set.
+        if (prefetchEnabled && deferred.length === 0 && chosen.length > 0 && this.pending.length > 0) {
+          const nextBatch = this.pending.splice(0, OPTIMISTIC_BATCH);
+          if (nextBatch.length > 0) {
+            const snapshotRoot = bytes32ToRootU64(this.rootBytes);
+            const rootArr = Array.from(snapshotRoot);
+            const nextPreexecs = Promise.all(
+              nextBatch.map((p) =>
+                this.pool.exec({
+                  id: this.nextId++,
+                  root: rootArr,
+                  signature: (p.job.data as any).value as TxWitness,
+                  skipVerify: (p.job.data as any).verified === true,
+                  session: MERKLE_SESSION_OVERLAY ? this.service.merkleSession : null,
+                }),
+              ),
+            );
+            prefetched = {
+              batch: nextBatch,
+              preexecs: nextPreexecs,
+              validateWrites: new Set(unionWrites),
+            };
+            didPrefetch = true;
+          }
+        }
+
         let cursor = 0;
         while (cursor < chosen.length) {
           const remainingInBundle = OPTIMISTIC_BUNDLE_SIZE - this.bundleTxCount;
@@ -573,16 +726,38 @@ class OptimisticSequencer {
               applyUpdateRecords += tx.updateRecords.length;
             }
             if (LIGHT_JOB_RESULT) {
-              const doApply = () => apply_txs_final_async(this.rootBytes, txs);
-              finalRootBytes = MERKLE_SESSION_OVERLAY ? await doApply() : await withMerkleSessionDisabledAsync(doApply);
+              if (this.commit) {
+                const resp = await this.commit.exec(
+                  "final",
+                  this.rootBytes,
+                  txs,
+                  MERKLE_SESSION_OVERLAY ? this.service.merkleSession : null,
+                );
+                if (!resp.ok) throw new Error(resp.error);
+                finalRootBytes = resp.finalRoot ?? null;
+              } else {
+                const doApply = () => apply_txs_final_async(this.rootBytes, txs);
+                finalRootBytes = MERKLE_SESSION_OVERLAY ? await doApply() : await withMerkleSessionDisabledAsync(doApply);
+              }
               if (!Array.isArray(finalRootBytes) || finalRootBytes.length !== 32) {
                 throw new Error(
                   `apply_txs_final returned ${Array.isArray(finalRootBytes) ? finalRootBytes.length : typeof finalRootBytes} bytes, expected 32`,
                 );
               }
             } else {
-              const doApply = () => apply_txs_async(this.rootBytes, txs);
-              roots = MERKLE_SESSION_OVERLAY ? await doApply() : await withMerkleSessionDisabledAsync(doApply);
+              if (this.commit) {
+                const resp = await this.commit.exec(
+                  "roots",
+                  this.rootBytes,
+                  txs,
+                  MERKLE_SESSION_OVERLAY ? this.service.merkleSession : null,
+                );
+                if (!resp.ok) throw new Error(resp.error);
+                roots = resp.roots ?? [];
+              } else {
+                const doApply = () => apply_txs_async(this.rootBytes, txs);
+                roots = MERKLE_SESSION_OVERLAY ? await doApply() : await withMerkleSessionDisabledAsync(doApply);
+              }
               if (!Array.isArray(roots) || roots.length !== segment.length) {
                 throw new Error(
                   `apply_txs returned ${Array.isArray(roots) ? roots.length : typeof roots} roots, expected ${segment.length}`,
@@ -670,6 +845,9 @@ class OptimisticSequencer {
             preexecOk,
             preexecErr,
             chosenRatio: ratio.toFixed(3),
+            validateWrites: validateWritesSize,
+            validateConflicts,
+            prefetch: didPrefetch,
             preexecWallMs: preexecWallMs.toFixed(2),
             applyWallMs: applyWallMs.toFixed(2),
             installWallMs: installWallMs.toFixed(2),
