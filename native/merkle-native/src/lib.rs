@@ -2,6 +2,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use std::collections::HashMap;
+use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -190,6 +191,10 @@ fn parse_u64_decimal(value: &str, name: &str) -> napi::Result<u64> {
       format!("invalid {name} u64 decimal: {value}"),
     )
   })
+}
+
+fn merkle_native_timing_enabled() -> bool {
+  matches!(std::env::var("MERKLE_NATIVE_TIMING").as_deref(), Ok("1"))
 }
 
 fn get_db(session: Option<String>) -> napi::Result<std::rc::Rc<std::cell::RefCell<dyn TreeDB>>> {
@@ -430,6 +435,11 @@ pub fn apply_txs(
   txs: Vec<ApplyTxTrace>,
   session: Option<String>,
 ) -> napi::Result<Vec<Buffer>> {
+  let timing = merkle_native_timing_enabled();
+  let t_total = timing.then(Instant::now);
+  let mut t_parse = DurationStats::default();
+  let mut t_flush = DurationStats::default();
+
   let root = to_bytes32(&root)?;
   let (db, maybe_batch) = if let Some(session) = session {
     (get_db(Some(session))?, None)
@@ -453,6 +463,7 @@ pub fn apply_txs(
 
   let mut roots: Vec<Buffer> = Vec::with_capacity(txs.len());
   for tx in txs {
+    let t0 = timing.then(Instant::now);
     for rec in tx.update_records {
       let hash = to_bytes32(&rec.hash)?;
       let mut bytes = Vec::with_capacity(rec.data.len() * 8);
@@ -470,11 +481,15 @@ pub fn apply_txs(
       mt.update_leaf_data_with_proof(index, &data.to_vec())
         .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
     }
+    if let Some(t0) = t0 {
+      t_parse.observe(t0.elapsed());
+    }
 
     roots.push(Buffer::from(mt.get_root_hash().to_vec()));
   }
 
   if let Some((mut base, merkle, data)) = maybe_batch {
+    let t0 = timing.then(Instant::now);
     let merkle_records: Vec<MerkleRecord> =
       std::mem::take(&mut *merkle.borrow_mut()).into_values().collect();
     let data_records: Vec<DataHashRecord> =
@@ -485,6 +500,20 @@ pub fn apply_txs(
     base
       .set_data_records(&data_records)
       .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
+    if let Some(t0) = t0 {
+      t_flush.observe(t0.elapsed());
+    }
+  }
+
+  if timing {
+    if let Some(t_total) = t_total {
+      eprintln!(
+        "[merkle_native] apply_txs total={:?} parse={:?} flush={:?}",
+        t_total.elapsed(),
+        t_parse.summary(),
+        t_flush.summary()
+      );
+    }
   }
 
   Ok(roots)
@@ -496,6 +525,13 @@ pub fn apply_txs_final(
   txs: Vec<ApplyTxTrace>,
   session: Option<String>,
 ) -> napi::Result<Buffer> {
+  let timing = merkle_native_timing_enabled();
+  let t_total = timing.then(Instant::now);
+  let mut t_parse = DurationStats::default();
+  let mut t_merkle = DurationStats::default();
+  let mut t_flush = DurationStats::default();
+
+  let tx_count = txs.len();
   let root = to_bytes32(&root)?;
   let (db, maybe_batch) = if let Some(session) = session {
     (get_db(Some(session))?, None)
@@ -517,7 +553,9 @@ pub fn apply_txs_final(
   let mut mongo_datahash = MongoDataHash::construct([0; 32], Some(db.clone()));
   let mut mt = MongoMerkle::<MERKLE_DEPTH>::construct([0; 32], root, Some(db));
 
+  let mut leaf_updates: Vec<(u64, [u8; 32])> = Vec::new();
   for tx in txs {
+    let t0 = timing.then(Instant::now);
     for rec in tx.update_records {
       let hash = to_bytes32(&rec.hash)?;
       let mut bytes = Vec::with_capacity(rec.data.len() * 8);
@@ -529,15 +567,26 @@ pub fn apply_txs_final(
         .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
     }
 
+    if let Some(t0) = t0 {
+      t_parse.observe(t0.elapsed());
+    }
+
     for w in tx.writes {
       let index = parse_u64_decimal(&w.index, "index")?;
       let data = to_bytes32(&w.data)?;
-      mt.update_leaf_data_with_proof(index, &data.to_vec())
-        .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
+      leaf_updates.push((index, data));
     }
   }
 
+  let t0 = timing.then(Instant::now);
+  mt.update_leaves_batch(&leaf_updates)
+    .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
+  if let Some(t0) = t0 {
+    t_merkle.observe(t0.elapsed());
+  }
+
   if let Some((mut base, merkle, data)) = maybe_batch {
+    let t0 = timing.then(Instant::now);
     let merkle_records: Vec<MerkleRecord> =
       std::mem::take(&mut *merkle.borrow_mut()).into_values().collect();
     let data_records: Vec<DataHashRecord> =
@@ -548,7 +597,55 @@ pub fn apply_txs_final(
     base
       .set_data_records(&data_records)
       .map_err(|e| napi::Error::new(Status::GenericFailure, format!("{e}")))?;
+    if let Some(t0) = t0 {
+      t_flush.observe(t0.elapsed());
+    }
+  }
+
+  if timing {
+    if let Some(t_total) = t_total {
+      eprintln!(
+        "[merkle_native] apply_txs_final total={:?} parse={:?} merkle={:?} flush={:?} txs={}",
+        t_total.elapsed(),
+        t_parse.summary(),
+        t_merkle.summary(),
+        t_flush.summary(),
+        tx_count
+      );
+    }
   }
 
   Ok(Buffer::from(mt.get_root_hash().to_vec()))
+}
+
+#[derive(Default)]
+struct DurationStats {
+  count: u64,
+  total: std::time::Duration,
+  max: std::time::Duration,
+}
+
+impl DurationStats {
+  fn observe(&mut self, d: std::time::Duration) {
+    self.count += 1;
+    self.total += d;
+    if d > self.max {
+      self.max = d;
+    }
+  }
+
+  fn summary(&self) -> DurationSummary {
+    DurationSummary {
+      count: self.count,
+      total: self.total,
+      max: self.max,
+    }
+  }
+}
+
+#[derive(Debug)]
+struct DurationSummary {
+  count: u64,
+  total: std::time::Duration,
+  max: std::time::Duration,
 }
