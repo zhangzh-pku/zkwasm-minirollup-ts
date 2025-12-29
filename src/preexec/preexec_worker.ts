@@ -19,7 +19,7 @@ type PreexecRequest = {
 
 type Trace = {
   reads?: string[];
-  writes?: Array<{ index: string; data: number[] }>;
+  writes?: Array<{ index: string; data: Uint8Array | number[] }>;
   getRecords?: Array<{ hash: number[] }>;
   updateRecords?: Array<{ hash: number[]; data: string[] }>;
 };
@@ -35,7 +35,7 @@ type PreexecOk = {
   finalRoot: bigint[];
   trace: {
     reads: string[];
-    writes: Array<{ index: string; data: number[] }>;
+    writes: Array<{ index: string; data: Uint8Array | number[] }>;
     getRecords: Array<{ hash: number[] }>;
     updateRecords: Array<{ hash: number[]; data: string[] }>;
   };
@@ -62,9 +62,10 @@ function normalizeTrace(trace: Trace): PreexecOk["trace"] {
   const updateRecords = Array.isArray(trace.updateRecords) ? trace.updateRecords : [];
 
   const uniqReads = Array.from(new Set(reads));
-  const lastWriteByIndex = new Map<string, number[]>();
+  const lastWriteByIndex = new Map<string, Uint8Array | number[]>();
   for (const w of writes) {
-    if (!w || typeof w.index !== "string" || !Array.isArray(w.data)) continue;
+    if (!w || typeof w.index !== "string") continue;
+    if (!Array.isArray(w.data) && !(w.data instanceof Uint8Array)) continue;
     lastWriteByIndex.set(w.index, w.data);
   }
   const uniqWrites = Array.from(lastWriteByIndex.entries()).map(([index, data]) => ({

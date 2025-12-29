@@ -179,6 +179,8 @@ function withSession(params) {
 }
 
 function hash2array(hash) {
+  if (Array.isArray(hash)) return hash;
+  if (hash instanceof Uint8Array) return Array.from(hash);
   const hasharray = [];
   for (let v of hash) {
       hasharray.push(v);
@@ -192,6 +194,13 @@ function bigintArray2array(hash) {
       hasharray.push(v.toString());
   }
   return hasharray;
+}
+
+function bytes32ToKey(value) {
+  if (Buffer.isBuffer(value)) return value.toString('hex');
+  if (value instanceof Uint8Array) return Buffer.from(value).toString('hex');
+  if (Array.isArray(value)) return Buffer.from(value).toString('hex');
+  return String(value);
 }
 
 function async_get_leaf(root, index) {
@@ -235,15 +244,11 @@ export function get_leaf(root, index) {
     }
     return overlayLeaf;
   }
-  const start = performance.now();
   let data = async_get_leaf(root, index);
-  const end = performance.now();
-  let lag = end - start;
-  //console.log("bench-log: get_leaf", lag);
   const trace = getMerkleTrace();
   if (trace) {
     if (!Array.isArray(trace.reads)) trace.reads = [];
-    trace.reads.push(index.toString());
+    trace.reads.push(indexKey);
   }
   return data;
 }
@@ -280,24 +285,23 @@ function async_update_leaf(root, index, data) {
 
 }
 export function update_leaf(root, index, data) {
-  const start = performance.now();
+  const trace = getMerkleTrace();
+  const indexKey = index.toString();
+  const writeData = MERKLE_RPC_MODE === 'native' ? data : hash2array(data);
+
   let r;
   if (traceOnlyWritesEnabled()) {
     const overlay = getMerkleOverlay();
-    overlaySet(overlay, "leaves", index.toString(), hash2array(data));
-    r = hash2array(root);
+    overlaySet(overlay, "leaves", indexKey, writeData);
+    r = MERKLE_RPC_MODE === 'native' ? root : hash2array(root);
   } else {
     r = async_update_leaf(root, index, data);
   }
-  const end = performance.now();
-  let lag = end - start;
-  //console.log("bench-log: update_leaf", lag);
-  const trace = getMerkleTrace();
   if (trace) {
     if (!Array.isArray(trace.writes)) trace.writes = [];
     trace.writes.push({
-      index: index.toString(),
-      data: hash2array(data),
+      index: indexKey,
+      data: writeData,
     });
   }
   return r;
@@ -333,24 +337,23 @@ function async_update_record(hash, data) {
 }
 
 export function update_record(hash, data) {
-  const start = performance.now();
+  const trace = getMerkleTrace();
+  const hashKey = bytes32ToKey(hash);
+  const hashArray = trace ? hash2array(hash) : null;
+  const dataArray = trace ? bigintArray2array(data) : null;
   let r;
   if (traceOnlyWritesEnabled()) {
     const overlay = getMerkleOverlay();
-    overlaySet(overlay, "records", hash2array(hash).join(","), data);
+    overlaySet(overlay, "records", hashKey, data);
     r = true;
   } else {
     r = async_update_record(hash, data);
   }
-  const end = performance.now();
-  let lag = end - start;
-  //console.log("bench-log: update_record", lag);
-  const trace = getMerkleTrace();
   if (trace) {
     if (!Array.isArray(trace.updateRecords)) trace.updateRecords = [];
     trace.updateRecords.push({
-      hash: hash2array(hash),
-      data: bigintArray2array(data),
+      hash: hashArray,
+      data: dataArray,
     });
   }
   return r;
@@ -508,27 +511,24 @@ function async_get_record(hash) {
 
 export function get_record(hash) {
   const overlay = getMerkleOverlay();
-  const overlayRecord = overlayGet(overlay, "records", hash2array(hash).join(","));
+  const trace = getMerkleTrace();
+  const hashKey = bytes32ToKey(hash);
+  const hashArray = trace ? hash2array(hash) : null;
+  const overlayRecord = overlayGet(overlay, "records", hashKey);
   if (overlayRecord !== undefined) {
-    const trace = getMerkleTrace();
     if (trace) {
       if (!Array.isArray(trace.getRecords)) trace.getRecords = [];
       trace.getRecords.push({
-        hash: hash2array(hash),
+        hash: hashArray,
       });
     }
     return overlayRecord;
   }
-  const start = performance.now();
   let r = async_get_record(hash);
-  const end = performance.now();
-  let lag = end - start;
-  //console.log("bench-log: update_record", lag);
-  const trace = getMerkleTrace();
   if (trace) {
     if (!Array.isArray(trace.getRecords)) trace.getRecords = [];
     trace.getRecords.push({
-      hash: hash2array(hash),
+      hash: hashArray,
     });
   }
   return r;

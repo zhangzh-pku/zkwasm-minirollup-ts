@@ -2,7 +2,7 @@ import { parentPort } from "node:worker_threads";
 
 import { apply_txs_async, apply_txs_final_async } from "../bootstrap/rpcbind.js";
 
-type ApplyLeafWrite = { index: string; data: number[] };
+type ApplyLeafWrite = { index: string; data: Uint8Array | number[] };
 type ApplyRecordUpdate = { hash: number[]; data: string[] };
 type ApplyTxTrace = { writes: ApplyLeafWrite[]; updateRecords: ApplyRecordUpdate[] };
 
@@ -79,4 +79,3 @@ parentPort.on("message", (msg: CommitRequest) => {
     }
   })();
 });
-

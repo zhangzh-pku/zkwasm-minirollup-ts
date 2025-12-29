@@ -148,7 +148,7 @@ const HTTP_BACKLOG = (() => {
 
 type PreexecTrace = {
   reads: string[];
-  writes: Array<{ index: string; data: number[] }>;
+  writes: Array<{ index: string; data: Uint8Array | number[] }>;
   getRecords: Array<{ hash: number[] }>;
   updateRecords: Array<{ hash: number[]; data: string[] }>;
 };
@@ -461,7 +461,7 @@ class PreexecPool {
 
 type CommitMode = "final" | "roots";
 
-type ApplyLeafWrite = { index: string; data: number[] };
+type ApplyLeafWrite = { index: string; data: Uint8Array | number[] };
 type ApplyRecordUpdate = { hash: number[]; data: string[] };
 type ApplyTxTrace = { writes: ApplyLeafWrite[]; updateRecords: ApplyRecordUpdate[] };
 
