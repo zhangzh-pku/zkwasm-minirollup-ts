@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
+import { cpus } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 import { createCommand, sign } from "zkwasm-minirollup-rpc";
 
 const PORT = parseInt(process.env.PORT ?? "3001", 10);
@@ -27,9 +29,15 @@ try {
 } catch {
   KEY_BASE = null;
 }
+const GEN_WORKERS = (() => {
+  const raw = parseInt(process.env.GEN_WORKERS ?? "", 10);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return Math.max(1, cpus().length);
+})();
 
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 const TS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const PAYLOAD_WORKER_URL = new URL("./tps_payload_worker.mjs", import.meta.url);
 
 function log(...args) {
   console.log("[tps]", ...args);
@@ -57,6 +65,73 @@ async function waitForReady() {
     await sleep(500);
   }
   throw new Error("service not ready");
+}
+
+async function generatePayloads(totalWithWarmup) {
+  const command = BigInt(process.env.COMMAND ?? "0");
+  const nonceBase = BigInt(process.env.NONCE_BASE ?? Date.now());
+
+  if (GEN_WORKERS <= 1 || totalWithWarmup <= 1) {
+    const payloads = new Array(totalWithWarmup);
+    for (let i = 0; i < totalWithWarmup; i++) {
+      const cmd = createCommand(nonceBase + BigInt(i), command, [0n, 0n, 0n, 0n]);
+      payloads[i] = sign(cmd, keyFor(i));
+    }
+    return payloads;
+  }
+
+  const workerCount = Math.min(GEN_WORKERS, totalWithWarmup);
+  log("generating payloads", { total: totalWithWarmup, workers: workerCount });
+
+  const payloads = new Array(totalWithWarmup);
+  const perWorker = Math.ceil(totalWithWarmup / workerCount);
+
+  const tasks = [];
+  for (let w = 0; w < workerCount; w++) {
+    const start = w * perWorker;
+    const end = Math.min(totalWithWarmup, start + perWorker);
+    if (start >= end) break;
+
+    tasks.push(
+      new Promise((resolve, reject) => {
+        const worker = new Worker(PAYLOAD_WORKER_URL, {
+          type: "module",
+          workerData: {
+            start,
+            end,
+            nonceBase: nonceBase.toString(),
+            command: command.toString(),
+            adminKey: ADMIN_KEY,
+            keyCount: KEY_COUNT,
+            keyBase: KEY_BASE === null ? null : KEY_BASE.toString(),
+          },
+        });
+        worker.once("message", (msg) => {
+          try {
+            const { start: offset, payloads: chunk } = msg ?? {};
+            if (!Number.isInteger(offset) || !Array.isArray(chunk)) {
+              throw new Error("invalid worker message");
+            }
+            for (let i = 0; i < chunk.length; i++) {
+              payloads[offset + i] = chunk[i];
+            }
+            resolve();
+          } catch (err) {
+            reject(err);
+          } finally {
+            worker.terminate().catch(() => {});
+          }
+        });
+        worker.once("error", reject);
+        worker.once("exit", (code) => {
+          if (code !== 0) reject(new Error(`payload worker exited with code ${code}`));
+        });
+      })
+    );
+  }
+
+  await Promise.all(tasks);
+  return payloads;
 }
 
 async function sendPayload(payload) {
@@ -163,6 +238,9 @@ try {
     });
   }
 
+  const totalWithWarmup = TOTAL + WARMUP;
+  const payloadPromise = generatePayloads(totalWithWarmup);
+
   await waitForReady();
   log("service ready");
 
@@ -184,12 +262,7 @@ try {
     };
   }
 
-  const payloads = [];
-  const totalWithWarmup = TOTAL + WARMUP;
-  for (let i = 0; i < totalWithWarmup; i++) {
-    const cmd = createCommand(NONCE_BASE + BigInt(i), COMMAND, [0n, 0n, 0n, 0n]);
-    payloads.push(sign(cmd, keyFor(i)));
-  }
+  const payloads = await payloadPromise;
 
   if (WARMUP > 0) {
     log("warmup", { WARMUP });
