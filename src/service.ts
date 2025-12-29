@@ -127,6 +127,17 @@ const SEND_ENQUEUE_MAX_PENDING = (() => {
   return OPTIMISTIC_APPLY ? 20000 : 5000;
 })();
 
+// Reuse parsed BigUint64Array from /send on the worker hot path.
+// - `SEND_U64_CACHE=1` stores u64 arrays in-process keyed by jobId (best-effort, local-only).
+// - `SEND_U64_IN_JOBDATA=1` additionally embeds a base64 payload into BullMQ job data (slower enqueue, cross-process).
+const SEND_U64_CACHE = OPTIMISTIC_APPLY && process.env.SEND_U64_CACHE !== "0";
+const SEND_U64_CACHE_MAX = (() => {
+  const raw = Number.parseInt(process.env.SEND_U64_CACHE_MAX ?? "", 10);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return SEND_ENQUEUE_MAX_PENDING;
+})();
+const SEND_U64_IN_JOBDATA = process.env.SEND_U64_IN_JOBDATA === "1";
+
 // Increase TCP accept backlog to reduce connection drops under extreme client concurrency.
 const HTTP_HOST = process.env.HTTP_HOST ?? "0.0.0.0";
 const HTTP_BACKLOG = (() => {
@@ -167,6 +178,7 @@ type PreexecRequest = {
   root: bigint[];
   signature?: TxWitness;
   u64?: string;
+  u64array?: BigUint64Array;
   skipVerify?: boolean;
   session?: string | null;
 };
@@ -368,6 +380,29 @@ class SendEnqueueBuffer {
         this.scheduleFlush();
       }
     }
+  }
+}
+
+class TxU64Cache {
+  private map = new Map<string, BigUint64Array>();
+
+  constructor(private maxEntries: number) {}
+
+  get(jobId: string): BigUint64Array | undefined {
+    return this.map.get(jobId);
+  }
+
+  set(jobId: string, u64array: BigUint64Array) {
+    this.map.set(jobId, u64array);
+    while (this.map.size > this.maxEntries) {
+      const oldest = this.map.keys().next().value as string | undefined;
+      if (typeof oldest !== "string") break;
+      this.map.delete(oldest);
+    }
+  }
+
+  delete(jobId: string) {
+    this.map.delete(jobId);
   }
 }
 
@@ -613,19 +648,22 @@ class OptimisticSequencer {
           const snapshotRoot = bytes32ToRootU64(this.rootBytes);
           const rootArr = Array.from(snapshotRoot);
           preexecPromise = Promise.all(
-            batch.map((p) =>
-              this.pool.exec({
+            batch.map((p) => {
+              const jobId = String(p.job.id);
+              const data = p.job.data as any;
+              const cached = this.service.txU64Cache?.get(jobId);
+              const b64 = typeof data?.u64 === "string" ? data.u64 : undefined;
+              const hasU64 = cached || b64;
+              return this.pool.exec({
                 id: this.nextId++,
                 root: rootArr,
-                u64: typeof (p.job.data as any)?.u64 === "string" ? (p.job.data as any).u64 : undefined,
-                signature:
-                  typeof (p.job.data as any)?.u64 === "string"
-                    ? undefined
-                    : ((p.job.data as any).value as TxWitness),
-                skipVerify: (p.job.data as any).verified === true,
+                u64array: cached,
+                u64: b64,
+                signature: hasU64 ? undefined : (data.value as TxWitness),
+                skipVerify: data.verified === true,
                 session: MERKLE_SESSION_OVERLAY ? this.service.merkleSession : null,
-              }),
-            ),
+              });
+            }),
           );
         }
 
@@ -643,6 +681,7 @@ class OptimisticSequencer {
           const resp = preexecs[i]!;
           if (!resp.ok) {
             preexecErr += 1;
+            this.service.txU64Cache?.delete(String(p.job.id));
             p.reject(new Error(resp.error));
             continue;
           }
@@ -677,6 +716,7 @@ class OptimisticSequencer {
           if (!isOk) {
             // If it doesn't depend on prior writes (no conflict), treat it as permanent failure.
             const errorMsg = application.decode_error(Number(errCode));
+            this.service.txU64Cache?.delete(String(p.job.id));
             p.reject(new Error(errorMsg));
             continue;
           }
@@ -694,19 +734,22 @@ class OptimisticSequencer {
             const snapshotRoot = bytes32ToRootU64(this.rootBytes);
             const rootArr = Array.from(snapshotRoot);
             const nextPreexecs = Promise.all(
-              nextBatch.map((p) =>
-                this.pool.exec({
+              nextBatch.map((p) => {
+                const jobId = String(p.job.id);
+                const data = p.job.data as any;
+                const cached = this.service.txU64Cache?.get(jobId);
+                const b64 = typeof data?.u64 === "string" ? data.u64 : undefined;
+                const hasU64 = cached || b64;
+                return this.pool.exec({
                   id: this.nextId++,
                   root: rootArr,
-                  u64: typeof (p.job.data as any)?.u64 === "string" ? (p.job.data as any).u64 : undefined,
-                  signature:
-                    typeof (p.job.data as any)?.u64 === "string"
-                      ? undefined
-                      : ((p.job.data as any).value as TxWitness),
-                  skipVerify: (p.job.data as any).verified === true,
+                  u64array: cached,
+                  u64: b64,
+                  signature: hasU64 ? undefined : (data.value as TxWitness),
+                  skipVerify: data.verified === true,
                   session: MERKLE_SESSION_OVERLAY ? this.service.merkleSession : null,
-                }),
-              ),
+                });
+              }),
             );
             prefetched = {
               batch: nextBatch,
@@ -778,6 +821,7 @@ class OptimisticSequencer {
             applyWallMs += performance.now() - applyStart;
           } catch (e) {
             for (const item of segment) {
+              this.service.txU64Cache?.delete(String(item.p.job.id));
               item.p.reject(e);
             }
             break;
@@ -809,6 +853,8 @@ class OptimisticSequencer {
               }
             } catch (e) {
               item.p.reject(e);
+            } finally {
+              this.service.txU64Cache?.delete(String(jobId));
             }
           }
           installWallMs += performance.now() - installStart;
@@ -967,7 +1013,10 @@ class OptimisticSequencer {
 
   private async applySerial(p: PendingJob): Promise<unknown> {
     const signature = (p.job.data as any).value as TxWitness;
+    const jobId = String(p.job.id);
     const u64array = (() => {
+      const cached = this.service.txU64Cache?.get(jobId);
+      if (cached) return cached;
       const b64 = (p.job.data as any)?.u64;
       if (typeof b64 === "string" && b64.length > 0) {
         try {
@@ -979,31 +1028,35 @@ class OptimisticSequencer {
       return signature_to_u64array(signature);
     })();
 
-    application.initialize(bytes32ToRootU64(this.rootBytes));
+    try {
+      application.initialize(bytes32ToRootU64(this.rootBytes));
 
-    if (!(p.job.name === "transaction" && (p.job.data as any).verified === true)) {
-      application.verify_tx_signature(u64array);
+      if (!(p.job.name === "transaction" && (p.job.data as any).verified === true)) {
+        application.verify_tx_signature(u64array);
+      }
+
+      const txResult = MERKLE_SESSION_OVERLAY ? application.handle_tx(u64array) : withMerkleSessionDisabled(() => application.handle_tx(u64array));
+      const errorCode = txResult[0];
+      if (errorCode !== 0n) {
+        throw new Error(application.decode_error(Number(errorCode)));
+      }
+
+      const postRoot = application.query_root();
+      this.rootBytes = rootU64ToBytes(postRoot);
+      this.service.optimisticHeadRoot = postRoot;
+
+      await this.service.optimisticInstall(signature, p.job.id, txResult, p.job.name === "replay");
+
+      this.bundleTxCount += 1;
+      if (this.bundleTxCount >= OPTIMISTIC_BUNDLE_SIZE) {
+        await this.flushBundle(this.rootBytes);
+        this.bundleTxCount = 0;
+      }
+
+      return await this.buildJobResult(p.job, signature);
+    } finally {
+      this.service.txU64Cache?.delete(jobId);
     }
-
-    const txResult = MERKLE_SESSION_OVERLAY ? application.handle_tx(u64array) : withMerkleSessionDisabled(() => application.handle_tx(u64array));
-    const errorCode = txResult[0];
-    if (errorCode !== 0n) {
-      throw new Error(application.decode_error(Number(errorCode)));
-    }
-
-    const postRoot = application.query_root();
-    this.rootBytes = rootU64ToBytes(postRoot);
-    this.service.optimisticHeadRoot = postRoot;
-
-    await this.service.optimisticInstall(signature, p.job.id, txResult, p.job.name === "replay");
-
-    this.bundleTxCount += 1;
-    if (this.bundleTxCount >= OPTIMISTIC_BUNDLE_SIZE) {
-      await this.flushBundle(this.rootBytes);
-      this.bundleTxCount = 0;
-    }
-
-    return await this.buildJobResult(p.job, signature);
   }
 }
 
@@ -1090,6 +1143,7 @@ export class Service {
   worker: null | Worker;
   queue: null | Queue;
   sendEnqueueBuffer: SendEnqueueBuffer | null;
+  txU64Cache: TxU64Cache | null;
   txCallback: (arg: TxWitness, events: BigUint64Array) => Promise<void>;
   txBatched: (arg: TxWitness[], preMerkleHexRoot: string, postMerkleRoot: string ) => Promise<void>;
   playerIndexer: (arg: any) => number;
@@ -1113,6 +1167,7 @@ export class Service {
     this.worker = null;
     this.queue = null;
     this.sendEnqueueBuffer = null;
+    this.txU64Cache = SEND_U64_CACHE ? new TxU64Cache(SEND_U64_CACHE_MAX) : null;
     this.txCallback = cb;
     this.txBatched = txBatched;
     this.registerAPICallback = registerAPICallback;
@@ -1870,6 +1925,7 @@ export class Service {
     console.log("install bootstrap txs");
     for (const value of await this.txManager.getTxFromCommit(merkleRootToBeHexString(this.merkleRoot))) {
       const u64 = (() => {
+        if (!SEND_U64_IN_JOBDATA) return undefined;
         try {
           return u64ArrayToBase64LE(signature_to_u64array(value));
         } catch {
@@ -1900,11 +1956,14 @@ export class Service {
       }
 
       try {
+        let u64array: BigUint64Array;
         let u64b64: string | undefined;
         try {
-          const u64array = signature_to_u64array(value);
+          u64array = signature_to_u64array(value);
           application.verify_tx_signature(u64array);
-          u64b64 = u64ArrayToBase64LE(u64array);
+          if (SEND_U64_IN_JOBDATA) {
+            u64b64 = u64ArrayToBase64LE(u64array);
+          }
         } catch (err) {
           console.error('Invalid signature:', err);
           return res.status(500).send('Invalid signature');
@@ -1930,19 +1989,32 @@ export class Service {
           }
         }
 
+        const hintedJobId = txJobId(value);
+        if (this.txU64Cache && hintedJobId) {
+          this.txU64Cache.set(hintedJobId, u64array);
+        }
+
         const job = (() => {
           if (this.sendEnqueueBuffer !== null) {
             return this.sendEnqueueBuffer.enqueue(value, u64b64);
           }
-          const jobId = txJobId(value);
-          if (jobId) {
-            return this.queue!.add('transaction', { value, verified: true, u64: u64b64 }, { jobId });
+          if (hintedJobId) {
+            return this.queue!.add('transaction', { value, verified: true, u64: u64b64 }, { jobId: hintedJobId });
           }
           return this.queue!.add('transaction', { value, verified: true, u64: u64b64 });
         })();
+        const enqueued = await job.catch((e) => {
+          if (this.txU64Cache && hintedJobId) {
+            this.txU64Cache.delete(hintedJobId);
+          }
+          throw e;
+        });
+        if (this.txU64Cache && !hintedJobId) {
+          this.txU64Cache.set(String(enqueued.id), u64array);
+        }
         return res.status(201).send({
           success: true,
-          jobid: (await job).id,
+          jobid: enqueued.id,
         });
       } catch (error) {
         console.error('Error adding job to the queue:', error);

@@ -12,6 +12,7 @@ type PreexecRequest = {
   root: bigint[];
   signature?: TxWitness;
   u64?: string;
+  u64array?: BigUint64Array;
   skipVerify?: boolean;
   session?: string | null;
 };
@@ -135,6 +136,9 @@ parentPort.on("message", (msg: PreexecRequest) => {
       }
 
       const u64array = (() => {
+        if (msg.u64array instanceof BigUint64Array) {
+          return msg.u64array;
+        }
         if (typeof msg.u64 === "string" && msg.u64.length > 0) {
           return base64ToU64ArrayLE(msg.u64);
         }
