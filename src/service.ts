@@ -13,6 +13,7 @@ import initApplication, * as application from "./application/application.js";
 import { test_merkle_db_service } from "./test.js";
 import { LeHexBN, sign, PlayerConvention, ZKWasmAppRpc, createCommand } from "zkwasm-minirollup-rpc";
 import { signature_to_u64array } from "./signature.js";
+import { base64ToU64ArrayLE, u64ArrayToBase64LE } from "./u64.js";
 import { Queue, Worker, Job } from 'bullmq';
 import IORedis from 'ioredis';
 import express, {Express} from 'express';
@@ -164,7 +165,8 @@ type PreexecResponse = PreexecOk | PreexecErr;
 type PreexecRequest = {
   id: number;
   root: bigint[];
-  signature: TxWitness;
+  signature?: TxWitness;
+  u64?: string;
   skipVerify?: boolean;
   session?: string | null;
 };
@@ -276,6 +278,7 @@ class OverloadedError extends Error {
 
 type PendingEnqueue = {
   value: TxWitness;
+  u64?: string;
   resolve: (job: Job) => void;
   reject: (err: Error) => void;
 };
@@ -292,12 +295,12 @@ class SendEnqueueBuffer {
     private maxPending: number,
   ) {}
 
-  enqueue(value: TxWitness): Promise<Job> {
+  enqueue(value: TxWitness, u64?: string): Promise<Job> {
     if (this.pending.length >= this.maxPending) {
       return Promise.reject(new OverloadedError(`Overloaded: pending=${this.pending.length}, max=${this.maxPending}`));
     }
     return new Promise((resolve, reject) => {
-      this.pending.push({ value, resolve, reject });
+      this.pending.push({ value, u64, resolve, reject });
       this.scheduleFlush();
     });
   }
@@ -324,7 +327,7 @@ class SendEnqueueBuffer {
         try {
           const bulk = batch.map((item) => ({
             name: "transaction",
-            data: { value: item.value, verified: true },
+            data: { value: item.value, verified: true, u64: item.u64 },
             opts: (() => {
               const jobId = txJobId(item.value);
               return jobId ? { jobId } : {};
@@ -614,7 +617,11 @@ class OptimisticSequencer {
               this.pool.exec({
                 id: this.nextId++,
                 root: rootArr,
-                signature: (p.job.data as any).value as TxWitness,
+                u64: typeof (p.job.data as any)?.u64 === "string" ? (p.job.data as any).u64 : undefined,
+                signature:
+                  typeof (p.job.data as any)?.u64 === "string"
+                    ? undefined
+                    : ((p.job.data as any).value as TxWitness),
                 skipVerify: (p.job.data as any).verified === true,
                 session: MERKLE_SESSION_OVERLAY ? this.service.merkleSession : null,
               }),
@@ -691,7 +698,11 @@ class OptimisticSequencer {
                 this.pool.exec({
                   id: this.nextId++,
                   root: rootArr,
-                  signature: (p.job.data as any).value as TxWitness,
+                  u64: typeof (p.job.data as any)?.u64 === "string" ? (p.job.data as any).u64 : undefined,
+                  signature:
+                    typeof (p.job.data as any)?.u64 === "string"
+                      ? undefined
+                      : ((p.job.data as any).value as TxWitness),
                   skipVerify: (p.job.data as any).verified === true,
                   session: MERKLE_SESSION_OVERLAY ? this.service.merkleSession : null,
                 }),
@@ -956,7 +967,17 @@ class OptimisticSequencer {
 
   private async applySerial(p: PendingJob): Promise<unknown> {
     const signature = (p.job.data as any).value as TxWitness;
-    const u64array = signature_to_u64array(signature);
+    const u64array = (() => {
+      const b64 = (p.job.data as any)?.u64;
+      if (typeof b64 === "string" && b64.length > 0) {
+        try {
+          return base64ToU64ArrayLE(b64);
+        } catch {
+          // fall through
+        }
+      }
+      return signature_to_u64array(signature);
+    })();
 
     application.initialize(bytes32ToRootU64(this.rootBytes));
 
@@ -1848,7 +1869,14 @@ export class Service {
     // replay uncommitted transactions
     console.log("install bootstrap txs");
     for (const value of await this.txManager.getTxFromCommit(merkleRootToBeHexString(this.merkleRoot))) {
-      this.queue!.add('replay', { value });
+      const u64 = (() => {
+        try {
+          return u64ArrayToBase64LE(signature_to_u64array(value));
+        } catch {
+          return undefined;
+        }
+      })();
+      this.queue!.add('replay', { value, u64 });
     }
     console.log("start express server");
     const app = express();
@@ -1872,9 +1900,11 @@ export class Service {
       }
 
       try {
+        let u64b64: string | undefined;
         try {
           const u64array = signature_to_u64array(value);
           application.verify_tx_signature(u64array);
+          u64b64 = u64ArrayToBase64LE(u64array);
         } catch (err) {
           console.error('Invalid signature:', err);
           return res.status(500).send('Invalid signature');
@@ -1902,13 +1932,13 @@ export class Service {
 
         const job = (() => {
           if (this.sendEnqueueBuffer !== null) {
-            return this.sendEnqueueBuffer.enqueue(value);
+            return this.sendEnqueueBuffer.enqueue(value, u64b64);
           }
           const jobId = txJobId(value);
           if (jobId) {
-            return this.queue!.add('transaction', { value, verified: true }, { jobId });
+            return this.queue!.add('transaction', { value, verified: true, u64: u64b64 }, { jobId });
           }
-          return this.queue!.add('transaction', { value, verified: true });
+          return this.queue!.add('transaction', { value, verified: true, u64: u64b64 });
         })();
         return res.status(201).send({
           success: true,

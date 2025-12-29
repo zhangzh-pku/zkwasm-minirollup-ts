@@ -3,13 +3,15 @@ import { parentPort } from "node:worker_threads";
 import initBootstrap, * as bootstrap from "../bootstrap/bootstrap.js";
 import initApplication, * as application from "../application/application.js";
 import { signature_to_u64array } from "../signature.js";
+import { base64ToU64ArrayLE } from "../u64.js";
 
 import type { TxWitness } from "../prover.js";
 
 type PreexecRequest = {
   id: number;
   root: bigint[];
-  signature: TxWitness;
+  signature?: TxWitness;
+  u64?: string;
   skipVerify?: boolean;
   session?: string | null;
 };
@@ -132,7 +134,15 @@ parentPort.on("message", (msg: PreexecRequest) => {
         lastRootKey = rootKey;
       }
 
-      const u64array = signature_to_u64array(msg.signature);
+      const u64array = (() => {
+        if (typeof msg.u64 === "string" && msg.u64.length > 0) {
+          return base64ToU64ArrayLE(msg.u64);
+        }
+        if (msg.signature) {
+          return signature_to_u64array(msg.signature);
+        }
+        throw new Error("missing tx signature");
+      })();
       const timingMs: PreexecOk["timingMs"] = { handleTx: 0 };
 
       if (!msg.skipVerify) {
