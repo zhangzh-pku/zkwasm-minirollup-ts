@@ -47,3 +47,28 @@ test("signature_to_u64array rejects wrong command size", () => {
     /Wrong Command Size/,
   );
 });
+
+test("signature parsers reject invalid hex fields", () => {
+  const cmd = createCommand(1n, 0n, [0n, 0n, 0n, 0n]);
+  const payload = sign(cmd, "1234567");
+  payload.pkx = "0xzz";
+  assert.throws(() => signatureToU64ArrayFast(payload), /Invalid pkx hex/);
+  assert.throws(() => signatureToU64ArrayCompat(payload), /Invalid pkx hex/);
+});
+
+test("signature parsers reject oversized fields", () => {
+  const cmd = createCommand(1n, 0n, [0n, 0n, 0n, 0n]);
+  const payload = sign(cmd, "1234567");
+  payload.pkx = `0x${"11".repeat(33)}`;
+  assert.throws(() => signatureToU64ArrayFast(payload), /pkx exceeds 4 words/);
+  assert.throws(() => signatureToU64ArrayCompat(payload), /pkx exceeds 4 words/);
+});
+
+test("signature parsers accept odd-length hex with padding", () => {
+  const cmd = createCommand(1n, 0n, [0n, 0n, 0n, 0n]);
+  const payload = sign(cmd, "1234567");
+  payload.pkx = "0xabc";
+  const compat = signatureToU64ArrayCompat(payload);
+  const fast = signatureToU64ArrayFast(payload);
+  assert.deepStrictEqual(Array.from(fast), Array.from(compat));
+});

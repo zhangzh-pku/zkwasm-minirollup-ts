@@ -33,6 +33,7 @@ import {TxStateManager} from "./commit.js";
 import {ensureAccountIndexes, queryAccounts, storeAccount} from "./account.js";
 import { MongoWriteBuffer } from "./mongo_write_buffer.js";
 import { shardForPkx } from "./sharding.js";
+import { buildRwSets, intersects, shouldEnterSerialFallback } from "./optimistic/selection.js";
 
 // Load environment variables from .env file
 dotenv.config();
@@ -138,6 +139,18 @@ const SEND_U64_CACHE_MAX = (() => {
 })();
 const SEND_U64_IN_JOBDATA = process.env.SEND_U64_IN_JOBDATA === "1";
 
+// Queue connection retries for Redis/BullMQ init.
+const QUEUE_CONNECT_RETRIES = (() => {
+  const raw = Number.parseInt(process.env.QUEUE_CONNECT_RETRIES ?? "3", 10);
+  if (Number.isFinite(raw) && raw >= 0) return raw;
+  return 3;
+})();
+const QUEUE_CONNECT_DELAY_MS = (() => {
+  const raw = Number.parseInt(process.env.QUEUE_CONNECT_DELAY_MS ?? "1000", 10);
+  if (Number.isFinite(raw) && raw >= 0) return raw;
+  return 1000;
+})();
+
 // Increase TCP accept backlog to reduce connection drops under extreme client concurrency.
 const HTTP_HOST = process.env.HTTP_HOST ?? "0.0.0.0";
 const HTTP_BACKLOG = (() => {
@@ -204,6 +217,37 @@ function rootU64ToBytes(root: BigUint64Array): number[] {
   return bytes;
 }
 
+type QueueFactory = (name: string, options: { connection: IORedis }) => Queue;
+
+let queueFactory: QueueFactory = (name, options) => new Queue(name, options);
+
+async function createQueueWithRetry(
+  queueName: string,
+  connection: IORedis,
+  retries = QUEUE_CONNECT_RETRIES,
+  delayMs = QUEUE_CONNECT_DELAY_MS,
+): Promise<Queue> {
+  let attempt = 0;
+  let lastErr: unknown = null;
+  while (attempt <= retries) {
+    try {
+      const queue = queueFactory(queueName, { connection });
+      if (typeof (queue as any).waitUntilReady === "function") {
+        await (queue as any).waitUntilReady();
+      }
+      return queue;
+    } catch (err) {
+      lastErr = err;
+      attempt += 1;
+      if (attempt > retries) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(`failed to connect queue ${queueName}`);
+}
+
 function bytes32ToRootU64(bytes: readonly number[]): BigUint64Array {
   if (bytes.length !== 32) {
     throw new Error(`expected 32 bytes, got ${bytes.length}`);
@@ -219,36 +263,13 @@ function bytes32ToRootU64(bytes: readonly number[]): BigUint64Array {
   return new BigUint64Array(limbs);
 }
 
-function recordKey(hash: readonly number[]): string {
-  return hash.join(",");
+function parseStartParam(raw: unknown): number | null {
+  if (raw === undefined || raw === null || raw === "") return 0;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return null;
+  return Math.floor(value);
 }
 
-function intersects(a: Set<string>, b: Set<string>): boolean {
-  for (const x of a) {
-    if (b.has(x)) return true;
-  }
-  return false;
-}
-
-function buildRwSets(trace: PreexecTrace): { reads: Set<string>; writes: Set<string> } {
-  const reads = new Set<string>();
-  const writes = new Set<string>();
-  for (const idx of trace.reads ?? []) {
-    reads.add(`leaf:${idx}`);
-  }
-  for (const w of trace.writes ?? []) {
-    writes.add(`leaf:${w.index}`);
-  }
-  for (const rec of trace.getRecords ?? []) {
-    if (!rec || !Array.isArray(rec.hash)) continue;
-    reads.add(`record:${recordKey(rec.hash)}`);
-  }
-  for (const rec of trace.updateRecords ?? []) {
-    if (!rec || !Array.isArray(rec.hash)) continue;
-    writes.add(`record:${recordKey(rec.hash)}`);
-  }
-  return { reads, writes };
-}
 
 function withMerkleSessionDisabled<T>(fn: () => T): T {
   const g = globalThis as any;
@@ -872,18 +893,16 @@ class OptimisticSequencer {
         }
 
         const considered = chosen.length + deferred.length;
-        if (considered > 0) {
+        if (shouldEnterSerialFallback(chosen.length, deferred.length, OPTIMISTIC_SERIAL_THRESHOLD)) {
           const ratio = chosen.length / considered;
-          if (deferred.length > 0 && ratio < OPTIMISTIC_SERIAL_THRESHOLD) {
-            this.serialUntilMs = Date.now() + OPTIMISTIC_SERIAL_COOLDOWN_MS;
-            if (LOG_OPTIMISTIC) {
-              console.log("optimistic apply: high conflict, switching to serial fallback", {
-                ratio: ratio.toFixed(3),
-                chosen: chosen.length,
-                deferred: deferred.length,
-                cooldownMs: OPTIMISTIC_SERIAL_COOLDOWN_MS,
-              });
-            }
+          this.serialUntilMs = Date.now() + OPTIMISTIC_SERIAL_COOLDOWN_MS;
+          if (LOG_OPTIMISTIC) {
+            console.log("optimistic apply: high conflict, switching to serial fallback", {
+              ratio: ratio.toFixed(3),
+              chosen: chosen.length,
+              deferred: deferred.length,
+              cooldownMs: OPTIMISTIC_SERIAL_COOLDOWN_MS,
+            });
           }
         }
 
@@ -1596,7 +1615,7 @@ export class Service {
     const shardId = get_shard_id();
     const queueName = get_queue_name();
     console.log("initialize sequener queue ...", { queueName, shardId, shardCount });
-    const myQueue = new Queue(queueName, {connection});
+    const myQueue = await createQueueWithRetry(queueName, connection);
 
     const waitingCount = await myQueue.getWaitingCount();
     console.log("waiting Count is:", waitingCount, " perform draining ...");
@@ -2082,14 +2101,14 @@ export class Service {
     });
 
     app.get('/data/players/:start?', async(req:any, res) => {
-      let start = req.params.start;
-      if (Number.isNaN(start)) {
+      const start = parseStartParam(req.params.start);
+      if (start === null) {
         res.status(201).send({
           success: false,
           data: [],
         });
       } else {
-        let data = await queryAccounts(Number(start));
+        let data = await queryAccounts(start);
         res.status(201).send({
           success: true,
           data: data,
@@ -2216,3 +2235,15 @@ export class Service {
   }
 
 }
+
+export const __test__ = {
+  SendEnqueueBuffer,
+  PreexecPool,
+  CommitPool,
+  OverloadedError,
+  createQueueWithRetry,
+  parseStartParam,
+  setQueueFactory: (factory: QueueFactory) => {
+    queueFactory = factory;
+  },
+};
