@@ -82,6 +82,24 @@ function normalizeTxsForNative(txs) {
   }));
 }
 
+function normalizeTxsForRpc(txs) {
+  if (!Array.isArray(txs)) return [];
+  return txs.map((tx) => ({
+    writes: Array.isArray(tx?.writes)
+      ? tx.writes.map((w) => ({
+          index: w?.index,
+          data: Array.isArray(w?.data) ? w.data : Array.from(w?.data ?? []),
+        }))
+      : [],
+    updateRecords: Array.isArray(tx?.updateRecords)
+      ? tx.updateRecords.map((r) => ({
+          hash: Array.isArray(r?.hash) ? r.hash : Array.from(r?.hash ?? []),
+          data: r?.data,
+        }))
+      : [],
+  }));
+}
+
 function requestMerkle(requestData) {
   if (MERKLE_RPC_MODE === 'mock') {
     let result;
@@ -373,7 +391,7 @@ function async_apply_txs(root, txs) {
   const requestData = {
     jsonrpc: '2.0',
     method: 'apply_txs',
-    params: withSession({ root: roothash, txs }),
+    params: withSession({ root: roothash, txs: normalizeTxsForRpc(txs) }),
     id: 9
   };
   let responseStr = requestMerkle(requestData);
@@ -409,7 +427,7 @@ function async_apply_txs_final(root, txs) {
   const requestData = {
     jsonrpc: '2.0',
     method: 'apply_txs_final',
-    params: withSession({ root: roothash, txs }),
+    params: withSession({ root: roothash, txs: normalizeTxsForRpc(txs) }),
     id: 10,
   };
   let responseStr = requestMerkle(requestData);
@@ -445,7 +463,7 @@ export async function apply_txs_async(root, txs) {
   const requestData = {
     jsonrpc: '2.0',
     method: 'apply_txs',
-    params: withSession({ root: roothash, txs }),
+    params: withSession({ root: roothash, txs: normalizeTxsForRpc(txs) }),
     id: 11,
   };
   const response = await requestMerkleAsync(requestData);
@@ -471,7 +489,7 @@ export async function apply_txs_final_async(root, txs) {
   const requestData = {
     jsonrpc: '2.0',
     method: 'apply_txs_final',
-    params: withSession({ root: roothash, txs }),
+    params: withSession({ root: roothash, txs: normalizeTxsForRpc(txs) }),
     id: 12,
   };
   const response = await requestMerkleAsync(requestData);

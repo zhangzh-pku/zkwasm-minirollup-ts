@@ -1,10 +1,14 @@
 import { spawn } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
+import { cpus } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 
 import { createCommand, sign } from "zkwasm-minirollup-rpc";
+import { shardForPkx } from "../src/sharding.js";
+import { merkleDbUriForShard, resolveMerkleDbUriBase } from "../src/sharded_bench_utils.js";
 
 const PORT_BASE = parseInt(process.env.PORT_BASE ?? "3001", 10);
 const SHARD_COUNT = parseInt(process.env.SHARD_COUNT ?? "1", 10);
@@ -22,20 +26,18 @@ const START_SERVICE = process.env.START_SERVICE !== "0";
 const NONCE_BASE = BigInt(process.env.NONCE_BASE ?? Date.now());
 const KEY_COUNT = parseInt(process.env.KEY_COUNT ?? "1", 10);
 const KEY_BASE = BigInt(process.env.KEY_BASE ?? ADMIN_KEY);
+const MERKLE_RPC_MODE = process.env.MERKLE_RPC_MODE ?? "syncproc";
+const GEN_WORKERS = (() => {
+  const raw = parseInt(process.env.GEN_WORKERS ?? "", 10);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return Math.max(1, cpus().length);
+})();
 
 const TS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const PAYLOAD_WORKER_URL = new URL("./tps_payload_worker.mjs", import.meta.url);
 
 function log(...args) {
   console.log("[sharded-tps]", ...args);
-}
-
-function shardForPkx(pkx, shardCount) {
-  if (shardCount <= 1) return 0;
-  const hex = pkx.startsWith("0x") ? pkx.slice(2) : pkx;
-  if (!/^[0-9a-fA-F]*$/.test(hex)) return 0;
-  const buf = Buffer.from(hex.length % 2 === 0 ? hex : `0${hex}`, "hex");
-  const digest = createHash("sha256").update(buf).digest();
-  return digest.readUInt32LE(0) % shardCount;
 }
 
 function keyFor(i) {
@@ -83,6 +85,72 @@ function randomImage() {
   return randomBytes(16).toString("hex");
 }
 
+async function generatePayloads(total) {
+  if (GEN_WORKERS <= 1 || total <= 1) {
+    const payloads = [];
+    for (let i = 0; i < total; i++) {
+      const cmd = createCommand(NONCE_BASE + BigInt(i), COMMAND, [0n, 0n, 0n, 0n]);
+      payloads.push(sign(cmd, keyFor(i)));
+    }
+    return payloads;
+  }
+
+  const workerCount = Math.min(GEN_WORKERS, total);
+  log("generating payloads", { total, workers: workerCount });
+
+  const payloads = new Array(total);
+  const perWorker = Math.ceil(total / workerCount);
+  const tasks = [];
+
+  // Match local `keyFor()` semantics when KEY_COUNT <= 1 (use KEY_BASE, not ADMIN_KEY).
+  const adminKeyForWorker = KEY_BASE.toString();
+  for (let w = 0; w < workerCount; w++) {
+    const start = w * perWorker;
+    const end = Math.min(total, start + perWorker);
+    if (start >= end) break;
+
+    tasks.push(
+      new Promise((resolve, reject) => {
+        const worker = new Worker(PAYLOAD_WORKER_URL, {
+          type: "module",
+          workerData: {
+            start,
+            end,
+            nonceBase: NONCE_BASE.toString(),
+            command: COMMAND.toString(),
+            adminKey: adminKeyForWorker,
+            keyCount: KEY_COUNT,
+            keyBase: KEY_BASE.toString(),
+          },
+        });
+        worker.once("message", (msg) => {
+          try {
+            const { start: offset, payloads: chunk } = msg ?? {};
+            if (!Number.isInteger(offset) || !Array.isArray(chunk)) {
+              throw new Error("invalid worker message");
+            }
+            for (let i = 0; i < chunk.length; i++) {
+              payloads[offset + i] = chunk[i];
+            }
+            resolve();
+          } catch (err) {
+            reject(err);
+          } finally {
+            worker.terminate().catch(() => {});
+          }
+        });
+        worker.once("error", reject);
+        worker.once("exit", (code) => {
+          if (code !== 0) reject(new Error(`payload worker exited with code ${code}`));
+        });
+      }),
+    );
+  }
+
+  await Promise.all(tasks);
+  return payloads;
+}
+
 let services = [];
 let redisMonitor = null;
 
@@ -95,20 +163,33 @@ try {
   log("starting", { SHARD_COUNT, PORT_BASE, IMAGE: image });
 
   if (START_SERVICE) {
+    const merkleDbBase = resolveMerkleDbUriBase(process.env);
+    if (MERKLE_RPC_MODE === "native" && !merkleDbBase) {
+      throw new Error("MERKLE_DB_URI is required when MERKLE_RPC_MODE=native");
+    }
     for (let shardId = 0; shardId < SHARD_COUNT; shardId++) {
       const port = PORT_BASE + shardId;
+      const env = {
+        ...process.env,
+        PORT: String(port),
+        IMAGE: image,
+        SHARD_ID: String(shardId),
+        SHARD_COUNT: String(SHARD_COUNT),
+        QUEUE_PREFIX,
+        ENFORCE_SHARD: "1",
+      };
+      if (MERKLE_RPC_MODE === "native") {
+        env.MERKLE_DB_URI = merkleDbUriForShard({
+          base: merkleDbBase,
+          image,
+          shardId,
+          shardCount: SHARD_COUNT,
+        });
+      }
       const service = spawn("node", ["src/run.js"], {
         cwd: TS_ROOT,
         stdio: ["ignore", "inherit", "inherit"],
-        env: {
-          ...process.env,
-          PORT: String(port),
-          IMAGE: image,
-          SHARD_ID: String(shardId),
-          SHARD_COUNT: String(SHARD_COUNT),
-          QUEUE_PREFIX,
-          ENFORCE_SHARD: "1",
-        },
+        env,
       });
       services.push({ shardId, port, proc: service });
     }
@@ -144,11 +225,7 @@ try {
   }
   redisMonitor = { connection, queues };
 
-  const payloads = [];
-  for (let i = 0; i < TOTAL; i++) {
-    const cmd = createCommand(NONCE_BASE + BigInt(i), COMMAND, [0n, 0n, 0n, 0n]);
-    payloads.push(sign(cmd, keyFor(i)));
-  }
+  const payloads = await generatePayloads(TOTAL);
 
   let cursor = 0;
   let sendErrors = 0;

@@ -12,6 +12,24 @@ function clampInt(value: unknown, fallback: number): number {
   return Math.floor(n);
 }
 
+export function queueNameForShard(prefix: string, shardCount: number, shardId: number): string {
+  if (shardCount <= 1) return prefix;
+  if (shardId >= shardCount) {
+    throw new Error(`invalid SHARD_ID=${shardId} for SHARD_COUNT=${shardCount}`);
+  }
+  return `${prefix}-${shardId}`;
+}
+
+export function mongooseDbNameForShard(
+  mongodbUri: string,
+  imageMD5Prefix: string,
+  shardCount: number,
+  shardId: number,
+): string {
+  const shardSuffix = shardCount > 1 ? `_shard${shardId}` : "";
+  return `${mongodbUri}/${imageMD5Prefix}_job-tracker${shardSuffix}`;
+}
+
 export const get_shard_count = () => {
   const n = clampInt(process.env.SHARD_COUNT, 1);
   return n > 0 ? n : 1;
@@ -27,14 +45,7 @@ export const get_queue_prefix = () => {
 }
 
 export const get_queue_name = () => {
-  const shardCount = get_shard_count();
-  const shardId = get_shard_id();
-  const prefix = get_queue_prefix();
-  if (shardCount <= 1) return prefix;
-  if (shardId >= shardCount) {
-    throw new Error(`invalid SHARD_ID=${shardId} for SHARD_COUNT=${shardCount}`);
-  }
-  return `${prefix}-${shardId}`;
+  return queueNameForShard(get_queue_prefix(), get_shard_count(), get_shard_id());
 }
 
 export const endpoint = "https://rpc.zkwasmhub.com:443";
@@ -70,12 +81,7 @@ export const get_mongodb_uri = () => {
 }
 
 export const get_mongoose_db = () => {
-  let mongodbUri = get_mongodb_uri();
-  let imageMD5Prefix = get_image_md5();
-  const shardCount = get_shard_count();
-  const shardId = get_shard_id();
-  const shardSuffix = shardCount > 1 ? `_shard${shardId}` : "";
-  return `${mongodbUri}/${imageMD5Prefix}_job-tracker${shardSuffix}`
+  return mongooseDbNameForShard(get_mongodb_uri(), get_image_md5(), get_shard_count(), get_shard_id());
 }
 
 export const get_service_port = () => {
@@ -221,4 +227,3 @@ export const modelBundle = mongoose.model('Bundle', bundleSchema);
 export const modelRand = mongoose.model('Rand', randSchema);
 
 export const ServiceHelper = new ZkWasmServiceHelper(endpoint, "", "");
-

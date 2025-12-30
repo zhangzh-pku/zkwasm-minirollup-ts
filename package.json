@@ -32,7 +32,7 @@
     "settle": "node src/settle.js",
     "build": "npx tsc",
     "build:native": "node scripts/build_merkle_native.mjs",
-    "test": "node --test test/**/*.js",
+    "test": "npm run build && node --test test/**/*.js",
     "postinstall": "npm run build"
   }
 }

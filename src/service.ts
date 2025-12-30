@@ -17,7 +17,6 @@ import { base64ToU64ArrayLE, u64ArrayToBase64LE } from "./u64.js";
 import { Queue, Worker, Job } from 'bullmq';
 import IORedis from 'ioredis';
 import express, {Express} from 'express';
-import { createHash } from 'node:crypto';
 import { cpus } from "node:os";
 import { Worker as NodeWorker } from "node:worker_threads";
 import { submitProofWithRetry, has_uncomplete_task, TxWitness, get_latest_proof, has_task } from "./prover.js";
@@ -33,6 +32,7 @@ import {sha256} from "ethers";
 import {TxStateManager} from "./commit.js";
 import {ensureAccountIndexes, queryAccounts, storeAccount} from "./account.js";
 import { MongoWriteBuffer } from "./mongo_write_buffer.js";
+import { shardForPkx } from "./sharding.js";
 
 // Load environment variables from .env file
 dotenv.config();
@@ -1060,19 +1060,11 @@ class OptimisticSequencer {
   }
 }
 
-function shardForPkx(pkx: string, shardCount: number): number {
-  if (shardCount <= 1) return 0;
-  const hex = pkx.startsWith("0x") ? pkx.slice(2) : pkx;
-  if (!/^[0-9a-fA-F]*$/.test(hex)) return 0;
-  const buf = Buffer.from(hex.length % 2 === 0 ? hex : `0${hex}`, "hex");
-  const digest = createHash("sha256").update(buf).digest();
-  return digest.readUInt32LE(0) % shardCount;
-}
-
 let deploymode = false;
 let remote = false;
 let migrate = false;
 let redisHost = 'localhost';
+let redisPort = 6379;
 
 //if md5 is invalid, this will throw an error; if unspecified, this will return false
 let hasTask = await has_task();
@@ -1098,6 +1090,12 @@ if (!hasTask && contractAddr != "unspecified") {
 
 if (process.env.REDISHOST) {
   redisHost = process.env.REDISHOST;
+}
+if (process.env.REDIS_PORT) {
+  const parsed = Number.parseInt(process.env.REDIS_PORT, 10);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    redisPort = parsed;
+  }
 }
 
 let taskid: string | null = null;
@@ -1500,11 +1498,11 @@ export class Service {
       });
     }
 
-    console.log("connecting redis server:", redisHost);
+    console.log("connecting redis server:", `${redisHost}:${redisPort}`);
     const connection = new IORedis(
       {
         host: redisHost,  // Your Redis server host
-        port: 6379,        // Your Redis server port
+        port: redisPort,        // Your Redis server port
         reconnectOnError: (err) => {
           console.log("reconnect on error", err);
           return true;
@@ -1951,7 +1949,7 @@ export class Service {
     app.post('/send', async (req, res) => {
       const value = req.body;
       //console.log("value is", value);
-      if (!value) {
+      if (!value || (typeof value === "object" && Object.keys(value).length === 0)) {
         return res.status(400).send('Value is required');
       }
 
