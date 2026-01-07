@@ -11,6 +11,9 @@ function clampPositiveInt(value: number, fallback: number): number {
   if (!Number.isFinite(value) || value <= 0) return fallback;
   return Math.floor(value);
 }
+
+const COMMIT_BATCH_SIZE_VALUE = clampPositiveInt(COMMIT_BATCH_SIZE, 200);
+const COMMIT_FLUSH_MS_VALUE = clampPositiveInt(COMMIT_FLUSH_MS, 50);
 const txSchema = new mongoose.Schema({
   msg: { type: String, required: true },
   pkx: { type: String, required: true },
@@ -151,8 +154,7 @@ export class TxStateManager {
       try {
         if (BATCH_COMMIT_WRITES) {
           this.pendingWrites.push({ key, tx });
-          const batchSize = clampPositiveInt(COMMIT_BATCH_SIZE, 200);
-          if (this.pendingWrites.length >= batchSize) {
+          if (this.pendingWrites.length >= COMMIT_BATCH_SIZE_VALUE) {
             const flush = this.flushPending("batch_full");
             if (ASYNC_COMMIT_WRITES) {
               void flush;
@@ -163,10 +165,10 @@ export class TxStateManager {
             this.scheduleFlush();
           }
         } else {
-          const write = CommitModel.findOneAndUpdate(
-              { key },
-              { $setOnInsert: { key }, $push: { items: tx } },
-              { upsert: true }
+          const write = CommitModel.updateOne(
+            { key },
+            { $setOnInsert: { key }, $push: { items: tx } },
+            { upsert: true }
           );
           if (ASYNC_COMMIT_WRITES) {
             void write.catch((error) => {
@@ -213,7 +215,7 @@ export class TxStateManager {
     private scheduleFlush() {
       if (!BATCH_COMMIT_WRITES) return;
       if (this.flushTimer) return;
-      const flushMs = clampPositiveInt(COMMIT_FLUSH_MS, 50);
+      const flushMs = COMMIT_FLUSH_MS_VALUE;
       this.flushTimer = setTimeout(() => {
         this.flushTimer = null;
         void this.flushPending("timer");
@@ -221,7 +223,7 @@ export class TxStateManager {
     }
 
     private async flushInternal(reason: string) {
-      const batchSize = clampPositiveInt(COMMIT_BATCH_SIZE, 200);
+      const batchSize = COMMIT_BATCH_SIZE_VALUE;
       while (this.pendingWrites.length > 0) {
         const key = this.pendingWrites[0]!.key;
         const batch: TxWitness[] = [];
@@ -233,7 +235,7 @@ export class TxStateManager {
           batch.push(this.pendingWrites.shift()!.tx);
         }
 
-        const write = CommitModel.findOneAndUpdate(
+        const write = CommitModel.updateOne(
           { key },
           { $setOnInsert: { key }, $push: { items: { $each: batch } } },
           { upsert: true }
